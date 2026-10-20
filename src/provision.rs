@@ -9,16 +9,18 @@
 //! A PSK pairing authenticates both ends cryptographically, so it needs no
 //! Touch ID; every credential request still does.
 //!
-//! `aac` uses its only cached connection automatically and refuses to choose
-//! between several, so a machine is paired with exactly one listener: a stale
-//! or foreign connection on it is cleared before pairing.
+//! This Mac's own `aac` is paired with this listener alone (`aac` refuses to
+//! choose between several connections). An ssh host may be paired with several
+//! Macs: while you use a Mac, its listener marks it present on each host every
+//! minute (`~/.local/state/aac-touchid/presence/<listener fingerprint>`), and
+//! the host's `aac` wrapper asks the Mac you used most recently.
 
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use ap_client::UserClient;
 use ap_client::IdentityProvider;
+use ap_client::UserClient;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -117,14 +119,7 @@ async fn aac(at: &Where, args: &[&str], token: Option<&str>) -> Result<(bool, St
         }
         Where::Ssh(host) => {
             let mut c = Command::new("/usr/bin/ssh");
-            c.args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                host,
-                &script,
-            ]);
+            c.args(SSH_OPTS).arg(host).arg(&script);
             c
         }
     };
@@ -161,10 +156,25 @@ async fn client_side(at: &Where) -> Result<ClientSide, String> {
     Ok(parse_list(&out))
 }
 
-/// Paired when the machine's only peer is this listener and the listener
-/// knows the machine's current identity.
-pub fn is_paired(side: &ClientSide, own: &str, known: &[String]) -> bool {
-    side.peers == [own.to_string()] && side.identity.as_ref().is_some_and(|id| known.contains(id))
+const SSH_OPTS: &[&str] = &[
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ClearAllForwardings=yes",
+];
+
+/// Paired when the listener knows the machine's current identity and the
+/// machine has this listener as its only peer (this Mac) or among its peers
+/// (an ssh host shared by several Macs).
+pub fn is_paired(side: &ClientSide, own: &str, known: &[String], shared: bool) -> bool {
+    let peers_ok = if shared {
+        side.peers.iter().any(|p| p == own)
+    } else {
+        side.peers == [own.to_string()]
+    };
+    peers_ok && side.identity.as_ref().is_some_and(|id| known.contains(id))
 }
 
 pub async fn listener_fingerprint(dir: &Path) -> Option<String> {
@@ -184,11 +194,15 @@ pub async fn ensure(
             .map(|c| c.devices().into_iter().map(|d| d.fingerprint).collect())
             .unwrap_or_default()
     };
+    let shared = matches!(target.at, Where::Ssh(_));
     let side = client_side(&target.at).await?;
-    if is_paired(&side, own, &known()) {
+    if is_paired(&side, own, &known(), shared) {
         return Ok("already paired");
     }
-    if !side.peers.is_empty() {
+    // A stale connection to this listener (or, on this Mac, any other) would
+    // make `aac` use a dead session; `aac` can only clear them all. Other Macs
+    // sharing a host re-pair on their next check.
+    if (!shared && !side.peers.is_empty()) || side.peers.iter().any(|p| p == own) {
         aac(
             &target.at,
             &[
@@ -223,7 +237,7 @@ pub async fn ensure(
     )
     .await?;
     let side = client_side(&target.at).await?;
-    if is_paired(&side, own, &known()) {
+    if is_paired(&side, own, &known(), shared) {
         Ok("paired")
     } else {
         Err("pairing did not complete".to_string())
@@ -240,6 +254,48 @@ pub async fn ensure_all(targets: &[Target], client: &UserClient, dir: &Path) {
             Ok("already paired") => {}
             Ok(outcome) => info!("pairing: {} {outcome}", t.name),
             Err(e) => warn!("pairing: {} not paired: {e}", t.name),
+        }
+    }
+}
+
+/// Seconds since the last keyboard or pointer input on this Mac.
+fn idle_secs() -> Option<u64> {
+    let out = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-c", "IOHIDSystem", "-d", "4"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.contains("\"HIDIdleTime\""))?;
+    let ns: u64 = line.rsplit('=').next()?.trim().parse().ok()?;
+    Some(ns / 1_000_000_000)
+}
+
+pub const PRESENCE_ACTIVE: u64 = 90;
+
+/// Mark this Mac present on each ssh host while someone is using it.
+pub async fn mark_present(targets: &[Target], own: &str, name: &str) {
+    let idle = tokio::task::spawn_blocking(idle_secs).await.ok().flatten();
+    if idle.is_none_or(|s| s > PRESENCE_ACTIVE) {
+        return;
+    }
+    for t in targets {
+        let Where::Ssh(host) = &t.at else { continue };
+        let script = format!(
+            "d=\"$HOME/.local/state/aac-touchid/presence\"; mkdir -p \"$d\" && echo \"$(date +%s) {}\" > \"$d/{own}.tmp\" && mv \"$d/{own}.tmp\" \"$d/{own}\"",
+            quote(name)
+        );
+        let status = Command::new("/usr/bin/ssh")
+            .args(SSH_OPTS)
+            .arg(host)
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status();
+        if !matches!(tokio::time::timeout(Duration::from_secs(20), status).await, Ok(Ok(s)) if s.success())
+        {
+            tracing::debug!("presence: {host} unreachable");
         }
     }
 }
@@ -269,25 +325,24 @@ mod tests {
 
     #[test]
     fn paired_needs_both_ends() {
-        let side = ClientSide {
+        let one = |peers: Vec<&str>| ClientSide {
             identity: Some(A.into()),
-            peers: vec![L.into()],
+            peers: peers.into_iter().map(String::from).collect(),
         };
-        assert!(is_paired(&side, L, &[A.into()]));
-        assert!(!is_paired(&side, L, &[]), "listener forgot the machine");
-        let two = ClientSide {
-            identity: Some(A.into()),
-            peers: vec![L.into(), A.into()],
-        };
+        assert!(is_paired(&one(vec![L]), L, &[A.into()], false));
         assert!(
-            !is_paired(&two, L, &[A.into()]),
-            "aac refuses to pick between two"
+            !is_paired(&one(vec![L]), L, &[], false),
+            "listener forgot the machine"
         );
-        let other = ClientSide {
-            identity: Some(A.into()),
-            peers: vec![A.into()],
-        };
-        assert!(!is_paired(&other, L, &[A.into()]));
+        assert!(
+            !is_paired(&one(vec![L, A]), L, &[A.into()], false),
+            "this Mac's aac needs one peer"
+        );
+        assert!(
+            is_paired(&one(vec![L, A]), L, &[A.into()], true),
+            "a shared host may have several"
+        );
+        assert!(!is_paired(&one(vec![A]), L, &[A.into()], true));
     }
 
     #[test]

@@ -663,6 +663,7 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         let mut provision = tokio::time::interval(PROVISION_EVERY);
+        let mut presence = tokio::time::interval(Duration::from_secs(60));
         let provisioning = Arc::new(tokio::sync::Mutex::new(()));
         let revoke = loop {
             tokio::select! {
@@ -695,6 +696,17 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     None => {}
                 },
                 _ = tick.tick() => svc.maybe_idle_lock().await,
+                _ = presence.tick() => {
+                    let (targets, dir) = (svc.cfg.targets.clone(), dir.clone());
+                    let name = svc.cfg.targets.iter()
+                        .find(|t| t.at == crate::provision::Where::Local)
+                        .map_or_else(|| "mac".to_string(), |t| t.name.clone());
+                    tokio::spawn(async move {
+                        if let Some(own) = crate::provision::listener_fingerprint(&dir).await {
+                            crate::provision::mark_present(&targets, &own, &name).await;
+                        }
+                    });
+                }
                 _ = provision.tick() => {
                     // First tick fires at once: pair right after connecting.
                     let (targets, client, dir, gate) =
