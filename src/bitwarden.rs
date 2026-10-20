@@ -15,7 +15,8 @@ const BW_FALLBACK_PATHS: &[&str] = &["/opt/homebrew/bin/bw", "/usr/local/bin/bw"
 
 #[derive(Debug)]
 pub enum Lookup {
-    Found(Box<CredentialData>),
+    /// The credential and the vault item's name.
+    Found(Box<CredentialData>, Option<String>),
     NotFound,
     /// Several logins match; the requester must ask by item id.
     Ambiguous(usize),
@@ -181,7 +182,10 @@ impl Vault {
             return Lookup::NotFound;
         };
         let uri = login.uris.iter().flatten().find_map(|u| u.uri.clone());
-        let domain = uri.as_deref().and_then(host_of).or(item.name);
+        let domain = uri
+            .as_deref()
+            .and_then(host_of)
+            .or_else(|| item.name.clone());
         // The vault stores the TOTP seed; send the current code instead.
         let totp = match (&login.totp, &item.id) {
             (Some(_), Some(id)) => self.cmd(&["get", "totp", id]).and_then(|mut c| {
@@ -192,15 +196,18 @@ impl Vault {
             }),
             _ => None,
         };
-        Lookup::Found(Box::new(CredentialData {
-            username: login.username,
-            password: login.password.map(Zeroizing::new),
-            totp,
-            uri,
-            notes: item.notes,
-            credential_id: item.id,
-            domain,
-        }))
+        Lookup::Found(
+            Box::new(CredentialData {
+                username: login.username,
+                password: login.password.map(Zeroizing::new),
+                totp,
+                uri,
+                notes: item.notes,
+                credential_id: item.id,
+                domain,
+            }),
+            item.name,
+        )
     }
 }
 

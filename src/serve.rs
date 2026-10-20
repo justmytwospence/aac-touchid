@@ -112,16 +112,56 @@ impl AuditLog for Audit {
     }
 }
 
-/// The touch prompt text: completes `"aac-touchid" is trying to <reason>.`
-pub fn credential_reason(domain: &str, username: Option<&str>, device: &str) -> String {
-    match username {
-        Some(u) if !u.is_empty() => format!("send the {domain} login ({u}) to \"{device}\""),
-        _ => format!("send the {domain} login to \"{device}\""),
+/// Split an agent's `--domain "github.com | why"` (or `--id`) into the
+/// lookup string and its stated purpose.
+pub fn split_purpose(raw: &str) -> (String, Option<String>) {
+    match raw.split_once('|') {
+        Some((what, why)) => {
+            let why: String = why
+                .trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(80)
+                .collect();
+            (what.trim().to_string(), (!why.is_empty()).then_some(why))
+        }
+        None => (raw.trim().to_string(), None),
     }
 }
 
+/// Mathematical sans-serif bold letters and digits: the system sheet has no
+/// rich text, but these render bold in the system font.
+pub fn bold(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let base = match c {
+                'A'..='Z' => Some(0x1D5D4 + (c as u32 - 'A' as u32)),
+                'a'..='z' => Some(0x1D5EE + (c as u32 - 'a' as u32)),
+                '0'..='9' => Some(0x1D7EC + (c as u32 - '0' as u32)),
+                _ => None,
+            };
+            base.and_then(char::from_u32).unwrap_or(c)
+        })
+        .collect()
+}
+
+/// The touch prompt text: completes `"aac-touchid" is trying to <reason>.`
+pub fn credential_reason(
+    item: &str,
+    username: Option<&str>,
+    device: &str,
+    purpose: Option<&str>,
+) -> String {
+    let who = match username {
+        Some(u) if !u.is_empty() => format!(" ({u})"),
+        _ => String::new(),
+    };
+    let why = purpose.unwrap_or("no reason given");
+    format!("share {}{who} with \"{device}\" \u{2014} {why}", bold(item))
+}
+
 pub fn pairing_reason(device: &str, code: &str) -> String {
-    format!("pair new device \"{device}\" (check code {code})")
+    format!("pair new device {} (check code {code})", bold(device))
 }
 
 /// Per-device denial memory.
@@ -245,6 +285,20 @@ impl Service {
                 identity,
                 reply,
             } => {
+                let (query, purpose) = match &query {
+                    CredentialQuery::Domain(d) => {
+                        let (d, why) = split_purpose(d);
+                        (CredentialQuery::Domain(d), why)
+                    }
+                    CredentialQuery::Id(id) => {
+                        let (id, why) = split_purpose(id);
+                        (CredentialQuery::Id(id), why)
+                    }
+                    CredentialQuery::Search(q) => {
+                        let (q, why) = split_purpose(q);
+                        (CredentialQuery::Search(q), why)
+                    }
+                };
                 let device = self.device_label(&identity);
                 let what = query_label(&query);
                 let deny = |reply: tokio::sync::oneshot::Sender<CredentialRequestReply>| {
@@ -263,8 +317,8 @@ impl Service {
                     self.quiet.note_denied(identity, &what);
                     return deny(reply);
                 }
-                let credential = match self.vault.lookup(&query) {
-                    Lookup::Found(c) => c,
+                let (credential, item_name) = match self.vault.lookup(&query) {
+                    Lookup::Found(c, name) => (c, name),
                     Lookup::Locked => {
                         self.lock("bw reported the session invalid");
                         self.record(&device, &what, "denied (vault locked)");
@@ -292,7 +346,13 @@ impl Service {
                     .domain
                     .clone()
                     .unwrap_or_else(|| query.search_string().to_string());
-                let reason = credential_reason(&domain, credential.username.as_deref(), &device);
+                let item = item_name.unwrap_or(domain);
+                let reason = credential_reason(
+                    &item,
+                    credential.username.as_deref(),
+                    &device,
+                    purpose.as_deref(),
+                );
                 let outcome = touchid::confirm(reason, self.cfg.approval_timeout).await;
                 self.last_activity = Instant::now();
                 if outcome == Outcome::Approved {
@@ -528,16 +588,19 @@ mod tests {
     #[test]
     fn reasons_name_device_domain_and_user() {
         assert_eq!(
-            credential_reason("github.com", Some("me@x.com"), "nuc"),
-            "send the github.com login (me@x.com) to \"nuc\""
+            credential_reason("GitHub", Some("me@x.com"), "nuc", Some("log in with gh")),
+            format!(
+                "share {} (me@x.com) with \"nuc\" \u{2014} log in with gh",
+                bold("GitHub")
+            )
         );
         assert_eq!(
-            credential_reason("x.com", None, "nuc"),
-            "send the x.com login to \"nuc\""
+            credential_reason("x", None, "nuc", None),
+            "share \u{1D605} with \"nuc\" \u{2014} no reason given"
         );
         assert_eq!(
             pairing_reason("nuc", "ab12cd"),
-            "pair new device \"nuc\" (check code ab12cd)"
+            format!("pair new device {} (check code ab12cd)", bold("nuc"))
         );
     }
 
@@ -551,6 +614,28 @@ mod tests {
         assert!(q.is_quiet(&a, "github.com"));
         assert!(!q.is_quiet(&a, "gitlab.com"));
         assert!(!q.is_quiet(&b, "github.com"));
+    }
+
+    #[test]
+    fn purposes_are_split_off_and_cleaned() {
+        assert_eq!(split_purpose("github.com"), ("github.com".into(), None));
+        assert_eq!(
+            split_purpose("github.com | log in with gh"),
+            ("github.com".into(), Some("log in with gh".into()))
+        );
+        assert_eq!(split_purpose("x.com |  "), ("x.com".into(), None));
+        assert_eq!(split_purpose("x.com|a\nb").1.as_deref(), Some("ab"));
+        assert_eq!(
+            split_purpose(&format!("x|{}", "y".repeat(200)))
+                .1
+                .map(|s| s.len()),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn bold_maps_letters_and_digits_only() {
+        assert_eq!(bold("Ab9-"), "\u{1D5D4}\u{1D5EF}\u{1D7F5}-");
     }
 
     #[test]
