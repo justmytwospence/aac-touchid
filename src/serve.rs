@@ -112,20 +112,43 @@ impl AuditLog for Audit {
     }
 }
 
-/// Split an agent's `--domain "github.com | why"` (or `--id`) into the
-/// lookup string and its stated purpose.
-pub fn split_purpose(raw: &str) -> (String, Option<String>) {
-    match raw.split_once('|') {
-        Some((what, why)) => {
-            let why: String = why
-                .trim()
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(80)
-                .collect();
-            (what.trim().to_string(), (!why.is_empty()).then_some(why))
-        }
-        None => (raw.trim().to_string(), None),
+/// What an agent put in `--domain` (or `--id`): `item | agent | reason`,
+/// or `item | reason`, or just `item`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Ask {
+    pub what: String,
+    pub agent: Option<String>,
+    pub why: Option<String>,
+}
+
+fn clean(s: &str, max: usize) -> Option<String> {
+    let s: String = s
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max)
+        .collect();
+    (!s.is_empty()).then_some(s)
+}
+
+pub fn parse_ask(raw: &str) -> Ask {
+    let mut parts = raw.splitn(3, '|');
+    let what = parts.next().unwrap_or_default().trim().to_string();
+    match (parts.next(), parts.next()) {
+        (Some(agent), Some(why)) => Ask {
+            what,
+            agent: clean(agent, 40),
+            why: clean(why, 80),
+        },
+        (Some(why), None) => Ask {
+            what,
+            agent: None,
+            why: clean(why, 80),
+        },
+        _ => Ask {
+            what,
+            ..Default::default()
+        },
     }
 }
 
@@ -145,23 +168,38 @@ pub fn bold(s: &str) -> String {
         .collect()
 }
 
-/// The touch prompt text: completes `"aac-touchid" is trying to <reason>.`
+/// The program name macOS shows as the sheet's title and at the start of its
+/// sentence (`"<name>" is trying to <reason>.`).
+pub const SHEET_NAME: &str = "Bitwarden";
+
+/// Who is asking: `agent (device)` with the agent in bold, or the device in bold.
+pub fn requester(agent: Option<&str>, device: &str) -> String {
+    match agent {
+        Some(a) => format!("{} ({device})", bold(a)),
+        None => bold(device),
+    }
+}
+
+/// Completes `Bitwarden is trying to <reason>.`
 pub fn credential_reason(
+    who: &str,
     item: &str,
     username: Option<&str>,
-    device: &str,
-    purpose: Option<&str>,
+    why: Option<&str>,
 ) -> String {
-    let who = match username {
+    let user = match username {
         Some(u) if !u.is_empty() => format!(" ({u})"),
         _ => String::new(),
     };
-    let why = purpose.unwrap_or("no reason given");
-    format!("share {}{who} with \"{device}\" \u{2014} {why}", bold(item))
+    format!(
+        "let {who} use {}{user}: {}",
+        bold(item),
+        why.unwrap_or("no reason given")
+    )
 }
 
 pub fn pairing_reason(device: &str, code: &str) -> String {
-    format!("pair new device {} (check code {code})", bold(device))
+    format!("pair {} as a new device (check code {code})", bold(device))
 }
 
 /// Per-device denial memory.
@@ -223,15 +261,19 @@ impl Service {
     }
 
     /// Unlock through the native dialog. Returns whether the vault is unlocked.
-    async fn ensure_unlocked(&mut self, device: &str, what: &str) -> bool {
+    async fn ensure_unlocked(&mut self, who: &str, what: &str, why: Option<&str>) -> bool {
         if self.vault.is_unlocked() {
             return true;
         }
         if self.unlock_quiet_until.is_some_and(|t| Instant::now() < t) {
             return false;
         }
+        let ask = match why {
+            Some(why) => format!("{who} wants {}: {why}", bold(what)),
+            None => format!("{who} wants {}", bold(what)),
+        };
         let mut message = format!(
-            "\"{device}\" asked for {what}.\n\nEnter your Bitwarden master password to unlock agent access. You will approve each credential with Touch ID."
+            "{ask}\n\nEnter your Bitwarden master password to unlock. You will approve each request with Touch ID."
         );
         for _ in 0..3 {
             let Some(password) =
@@ -250,8 +292,7 @@ impl Service {
                 }
                 Err(e) => {
                     warn!("unlock failed: {e}");
-                    message =
-                        format!("Unlock failed: {e}\n\n\"{device}\" asked for {what}. Try again.");
+                    message = format!("Unlock failed: {e}\n\n{ask}\n\nTry again.");
                 }
             }
         }
@@ -269,6 +310,7 @@ impl Service {
                     .take()
                     .unwrap_or_else(|| "new device".to_string());
                 let outcome = touchid::confirm(
+                    Some(SHEET_NAME),
                     pairing_reason(&name, &fingerprint),
                     self.cfg.approval_timeout,
                 )
@@ -285,21 +327,22 @@ impl Service {
                 identity,
                 reply,
             } => {
-                let (query, purpose) = match &query {
+                let (query, ask) = match &query {
                     CredentialQuery::Domain(d) => {
-                        let (d, why) = split_purpose(d);
-                        (CredentialQuery::Domain(d), why)
+                        let a = parse_ask(d);
+                        (CredentialQuery::Domain(a.what.clone()), a)
                     }
                     CredentialQuery::Id(id) => {
-                        let (id, why) = split_purpose(id);
-                        (CredentialQuery::Id(id), why)
+                        let a = parse_ask(id);
+                        (CredentialQuery::Id(a.what.clone()), a)
                     }
                     CredentialQuery::Search(q) => {
-                        let (q, why) = split_purpose(q);
-                        (CredentialQuery::Search(q), why)
+                        let a = parse_ask(q);
+                        (CredentialQuery::Search(a.what.clone()), a)
                     }
                 };
                 let device = self.device_label(&identity);
+                let who = requester(ask.agent.as_deref(), &device);
                 let what = query_label(&query);
                 let deny = |reply: tokio::sync::oneshot::Sender<CredentialRequestReply>| {
                     let _ = reply.send(CredentialRequestReply {
@@ -312,7 +355,7 @@ impl Service {
                     self.record(&device, &what, "denied (repeat within 60 s)");
                     return deny(reply);
                 }
-                if !self.ensure_unlocked(&device, &what).await {
+                if !self.ensure_unlocked(&who, &what, ask.why.as_deref()).await {
                     self.record(&device, &what, "denied (vault locked)");
                     self.quiet.note_denied(identity, &what);
                     return deny(reply);
@@ -348,15 +391,22 @@ impl Service {
                     .unwrap_or_else(|| query.search_string().to_string());
                 let item = item_name.unwrap_or(domain);
                 let reason = credential_reason(
+                    &who,
                     &item,
                     credential.username.as_deref(),
-                    &device,
-                    purpose.as_deref(),
+                    ask.why.as_deref(),
                 );
-                let outcome = touchid::confirm(reason, self.cfg.approval_timeout).await;
+                let outcome =
+                    touchid::confirm(Some(SHEET_NAME), reason, self.cfg.approval_timeout).await;
                 self.last_activity = Instant::now();
                 if outcome == Outcome::Approved {
-                    self.record(&device, &what, "approved");
+                    self.record(
+                        &ask.agent
+                            .clone()
+                            .map_or(device.clone(), |a| format!("{a} ({device})")),
+                        &what,
+                        "approved",
+                    );
                     let credential_id = credential.credential_id.clone();
                     let _ = reply.send(CredentialRequestReply {
                         approved: true,
@@ -586,21 +636,24 @@ mod tests {
     use ap_proxy_protocol::IdentityKeyPair;
 
     #[test]
-    fn reasons_name_device_domain_and_user() {
+    fn sheet_texts() {
+        let who = requester(Some("pi \u{b7} homelab"), "nuc");
+        assert_eq!(who, format!("{} (nuc)", bold("pi \u{b7} homelab")));
+        assert_eq!(requester(None, "nuc"), bold("nuc"));
         assert_eq!(
-            credential_reason("GitHub", Some("me@x.com"), "nuc", Some("log in with gh")),
+            credential_reason(&who, "GitHub", Some("me@x.com"), Some("log in with gh")),
             format!(
-                "share {} (me@x.com) with \"nuc\" \u{2014} log in with gh",
+                "let {who} use {} (me@x.com): log in with gh",
                 bold("GitHub")
             )
         );
         assert_eq!(
-            credential_reason("x", None, "nuc", None),
-            "share \u{1D605} with \"nuc\" \u{2014} no reason given"
+            credential_reason("n", "x", None, None),
+            "let n use \u{1D605}: no reason given"
         );
         assert_eq!(
             pairing_reason("nuc", "ab12cd"),
-            format!("pair new device {} (check code ab12cd)", bold("nuc"))
+            format!("pair {} as a new device (check code ab12cd)", bold("nuc"))
         );
     }
 
@@ -617,17 +670,35 @@ mod tests {
     }
 
     #[test]
-    fn purposes_are_split_off_and_cleaned() {
-        assert_eq!(split_purpose("github.com"), ("github.com".into(), None));
+    fn asks_are_parsed_and_cleaned() {
         assert_eq!(
-            split_purpose("github.com | log in with gh"),
-            ("github.com".into(), Some("log in with gh".into()))
+            parse_ask("github.com"),
+            Ask {
+                what: "github.com".into(),
+                ..Default::default()
+            }
         );
-        assert_eq!(split_purpose("x.com |  "), ("x.com".into(), None));
-        assert_eq!(split_purpose("x.com|a\nb").1.as_deref(), Some("ab"));
         assert_eq!(
-            split_purpose(&format!("x|{}", "y".repeat(200)))
-                .1
+            parse_ask("github.com | log in with gh"),
+            Ask {
+                what: "github.com".into(),
+                agent: None,
+                why: Some("log in with gh".into())
+            }
+        );
+        assert_eq!(
+            parse_ask("github.com | pi \u{b7} homelab | log in | with gh"),
+            Ask {
+                what: "github.com".into(),
+                agent: Some("pi \u{b7} homelab".into()),
+                why: Some("log in | with gh".into())
+            }
+        );
+        assert_eq!(parse_ask("x.com |  ").why, None);
+        assert_eq!(parse_ask("x.com|a\nb").why.as_deref(), Some("ab"));
+        assert_eq!(
+            parse_ask(&format!("x|{}", "y".repeat(200)))
+                .why
                 .map(|s| s.len()),
             Some(80)
         );

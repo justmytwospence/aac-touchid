@@ -5,16 +5,17 @@ A background [Bitwarden Agent Access](https://github.com/bitwarden/agent-access)
 Agents keep using Bitwarden's own client, `aac` 0.11:
 
 ```sh
-aac run --domain "github.com | check gh login" --env GH_TOKEN=password -- gh auth status
+aac run --domain "github.com | pi · homelab | check gh login" --env GH_TOKEN=password -- gh auth status
 ```
 
-Text after ` | ` is the agent's one-line reason. It is shown on the sheet and removed before the vault lookup.
+`--domain` (or `--id`) may carry `item | agent | reason`, or `item | reason`. The agent's name and reason are shown on the sheet and removed before the vault lookup. Both are the agent's own claims; the device name (from pairing) is verified.
 
 The request travels end to end encrypted through the Agent Access relay to this listener on your Mac. The listener looks up the item with the Bitwarden CLI (`bw`) and shows a system sheet:
 
-> "aac-touchid" is trying to share 𝗚𝗶𝘁𝗛𝘂𝗯 (you@example.com) with "nuc" — check gh login.
+> **Bitwarden**
+> Bitwarden is trying to let **𝗽𝗶 · 𝗵𝗼𝗺𝗲𝗹𝗮𝗯** (nuc) use **𝗚𝗶𝘁𝗛𝘂𝗯** (you@example.com): check gh login.
 
-The vault item's name is set in bold letters (the system sheet has no rich text, so they are Unicode mathematical bold characters).
+The sheet has no rich text, so the agent and item names use Unicode mathematical bold letters. macOS titles the sheet with the program's name, so the prompt runs through a link named `Bitwarden`.
 
 If you touch the sensor, the secret goes to that device and into the command's environment. If you cancel or don't answer within 60 s, the agent gets `aac` exit code 4 ("Request denied").
 
@@ -56,7 +57,7 @@ State (identity key, paired devices) lives in `~/Library/Application Support/aac
 
 Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents, the machines they run on, and the relay.
 
-- Every credential needs a biometric or Watch approval (LocalAuthentication `deviceOwnerAuthenticationWithBiometricsOrCompanion`, password fallback hidden). The sheet names the vault item, the username, the device and the agent's stated reason.
+- Every credential needs a biometric or Watch approval (LocalAuthentication `deviceOwnerAuthenticationWithBiometricsOrCompanion`, password fallback hidden). The sheet names the agent (self-reported) and its device (verified), the vault item, the username and the agent's stated reason.
 - Only paired devices can ask. Pairing needs a code from `aac-touchid pair` and a Touch ID approval of the device's verification code. A code an agent obtains alone does not pair anything.
 - After a denial, the same device asking for the same item is denied silently for 60 s, and a cancelled unlock dialog is not shown again for 2 minutes, so an agent cannot spam prompts.
 - The Bitwarden session key lives only in this process's memory. It and the master password reach `bw` only as the environment of short-lived child processes. Locking runs `bw lock`, so a leaked session key stops working.
