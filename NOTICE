@@ -1,0 +1,12 @@
+aac-touchid
+Copyright 2026 Spencer Boucher
+
+This product uses the Bitwarden Agent Access SDK crates (ap-client, ap-noise,
+ap-proxy-protocol), Copyright Bitwarden Inc., licensed under the Apache
+License 2.0: https://github.com/bitwarden/agent-access
+
+src/storage.rs and src/bitwarden.rs are adapted from Bitwarden Agent Access
+ap-cli v0.11.0 (crates/ap-cli/src/storage and crates/ap-cli/src/providers/
+bitwarden.rs), licensed under the Apache License 2.0.
+
+This project is not affiliated with or endorsed by Bitwarden.
