@@ -6,6 +6,7 @@
 mod bitwarden;
 mod control;
 mod dialog;
+mod provision;
 mod serve;
 mod storage;
 mod touchid;
@@ -40,6 +41,12 @@ enum Command {
         /// Seconds to wait for a Touch ID answer before denying.
         #[arg(long, default_value_t = 60)]
         approval_timeout: u64,
+        /// Keep this Mac's own `aac` paired, under this name.
+        #[arg(long, value_name = "NAME")]
+        pair_local: Option<String>,
+        /// Keep this ssh host's `aac` paired (repeatable).
+        #[arg(long, value_name = "HOST")]
+        pair_ssh: Vec<String>,
     },
     /// Print a one-time pairing code (5 minutes) for a new device.
     Pair {
@@ -76,6 +83,8 @@ fn main() -> ExitCode {
                 proxy_url,
                 lock_after_hours,
                 approval_timeout,
+                pair_local,
+                pair_ssh,
             } => {
                 tracing_subscriber::fmt()
                     .with_env_filter(
@@ -89,6 +98,11 @@ fn main() -> ExitCode {
                     proxy_url,
                     lock_after: Duration::from_secs(lock_after_hours * 3600),
                     approval_timeout: Duration::from_secs(approval_timeout),
+                    targets: pair_local
+                        .iter()
+                        .map(|n| provision::Target::local(n))
+                        .chain(pair_ssh.iter().map(|h| provision::Target::ssh(h)))
+                        .collect(),
                 };
                 match serve::run(cfg).await {
                     Ok(()) => ExitCode::SUCCESS,

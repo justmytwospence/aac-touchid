@@ -37,18 +37,26 @@ It replaces the interactive `aac listen` terminal app. There is nothing to keep 
 
 ```xml
 <key>ProgramArguments</key>
-<array><string>/Users/you/.local/libexec/aac-touchid/Bitwarden</string><string>serve</string></array>
+<array>
+  <string>/Users/you/.local/libexec/aac-touchid/Bitwarden</string><string>serve</string>
+  <string>--pair-local</string><string>my-mac</string>
+  <string>--pair-ssh</string><string>my-server</string>
+</array>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>
 <key>EnvironmentVariables</key>
 <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin</string></dict>
 ```
 
+There is no setup step. With `--pair-local NAME` and `--pair-ssh HOST` (repeatable), the listener keeps those machines' `aac` clients paired with itself: whenever it connects to the relay, and every 30 minutes, it checks each one and pairs any that isn't, by handing a one-time pre-shared-key token to that machine's `aac` over the local process or ssh (on stdin). `aac` uses its only connection automatically and refuses to choose between several, so each machine is paired with exactly one listener; a stale or foreign connection on it is cleared first. ssh runs in batch mode, so the host must accept your key without a prompt.
+
+If the Bitwarden CLI is not logged in, the first request's dialog asks for your personal API key (client_id, then client_secret) before the master password.
+
 Commands:
 
 | Command | What it does |
 |---|---|
-| `aac-touchid pair [name]` | Prints a one-time pairing code (valid 5 minutes). Its first use on another machine (`aac run --token <code> ...`) shows a Touch ID sheet asking to pair device `name`. |
+| `aac-touchid pair [name]` | For a machine you can't list with `--pair-*`: prints a one-time pairing code (valid 5 minutes). Its first use (`aac run --token <code> ...`) shows a Touch ID sheet asking to pair device `name`. |
 | `aac-touchid status` | Lock state, relay connection, paired devices, recent decisions. |
 | `aac-touchid lock` | Locks the vault now. |
 | `aac-touchid revoke <name>` | Forgets a paired device. |
@@ -62,9 +70,10 @@ State (identity key, paired devices) lives in `~/Library/Application Support/aac
 Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents, the machines they run on, and the relay.
 
 - Every credential needs a biometric or Watch approval (LocalAuthentication `deviceOwnerAuthenticationWithBiometricsOrCompanion`, password fallback hidden). The sheet names the agent (self-reported) and its device (verified), the vault item, the username and the agent's stated reason.
-- Only paired devices can ask. Pairing needs a code from `aac-touchid pair` and a Touch ID approval of the device's verification code. A code an agent obtains alone does not pair anything.
+- Only paired devices can ask. Automatic pairing goes only to the machines named in the service's arguments, with a one-time PSK token delivered over the local process or authenticated ssh; the Noise PSK handshake binds it to that listener. Manual pairing needs a code from `aac-touchid pair` and a Touch ID approval. A code an agent obtains alone does not pair anything.
 - After a denial, the same device asking for the same item is denied silently for 60 s, and a cancelled unlock dialog is not shown again for 2 minutes, so an agent cannot spam prompts.
-- No secret ever goes into an environment variable or a command line, where any process of the same user can read it (`ps -E`). The listener runs one `bw serve` child on a private socket pair (`--hostname fd+connected://3`, a supported `bw serve` mode) that no other process can open; the master password travels once in its `POST /unlock` body and the vault key stays inside that child. Locking calls `/lock` and stops the child.
+- The master password and vault key never go into an environment variable or a command line, where any process of the same user can read it (`ps -E`). The listener runs one `bw serve` child on a private socket pair (`--hostname fd+connected://3`, a supported `bw serve` mode) that no other process can open; the master password travels once in its `POST /unlock` body and the vault key stays inside that child. Locking calls `/lock` and stops the child.
+- `bw login --apikey` reads the API key only from its environment, so on first login the key is in that one short-lived child's environment. The API key alone cannot decrypt the vault.
 - Only username, password, URI and the current 2FA code (never the TOTP seed) are released.
 - Agent names are reduced to letters, digits, spaces and `· . - _ / @`, so a name cannot fake a device suffix or extra lines. Pairing completes only within 5 minutes of `aac-touchid pair`, and the sheet names the device and when its code was issued.
 - The relay sees only device fingerprints and timing (Noise protocol, end to end).

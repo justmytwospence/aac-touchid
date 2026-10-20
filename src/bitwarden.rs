@@ -175,6 +175,48 @@ impl Vault {
         result
     }
 
+    /// Whether the CLI has no account logged in. Asks the private `bw serve`.
+    pub async fn needs_login(&mut self) -> bool {
+        if self.bw.is_none() {
+            return false;
+        }
+        match self.call("GET", "/status", None).await {
+            Ok(v) => v["data"]["template"]["status"].as_str() == Some("unauthenticated"),
+            Err(_) => false,
+        }
+    }
+
+    /// Log in with a personal API key. `bw login --apikey` reads the key only
+    /// from its environment, so it is passed to that one short-lived child;
+    /// an API key alone cannot decrypt the vault. `bw serve` is restarted
+    /// afterwards so it sees the new account.
+    pub async fn log_in(&mut self, client_id: &str, client_secret: &str) -> Result<(), String> {
+        let bw = self.bw.clone().ok_or("Bitwarden CLI (bw) not found")?;
+        self.lock().await;
+        let out = Command::new(bw)
+            .args(["login", "--apikey", "--raw"])
+            .env("BW_CLIENTID", client_id)
+            .env("BW_CLIENTSECRET", client_secret)
+            .env("BW_NOINTERACTION", "true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| format!("bw login: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(if msg.is_empty() {
+                "bw login failed".to_string()
+            } else {
+                msg
+            })
+        }
+    }
+
     /// Unlock with the master password, then sync.
     pub async fn unlock(&mut self, password: &str) -> Result<(), String> {
         let mut body = serde_json::to_vec(&serde_json::json!({ "password": password }))

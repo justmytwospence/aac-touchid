@@ -24,7 +24,11 @@ pub struct Config {
     pub proxy_url: String,
     pub lock_after: Duration,
     pub approval_timeout: Duration,
+    /// Machines whose `aac` this listener keeps paired.
+    pub targets: Vec<crate::provision::Target>,
 }
+
+const PROVISION_EVERY: Duration = Duration::from_secs(30 * 60);
 
 /// After a denial, the same device asking for the same thing is denied
 /// silently for this long, so an agent cannot spam prompts.
@@ -299,6 +303,10 @@ impl Service {
             bold(what),
             why.unwrap_or("no reason given")
         );
+        if self.vault.needs_login().await && !self.log_in(&ask).await {
+            self.unlock_quiet_until = Some(Instant::now() + UNLOCK_QUIET);
+            return false;
+        }
         let mut message =
             format!("{ask}\n\nEnter your Bitwarden master password to unlock agent requests.");
         for _ in 0..3 {
@@ -323,6 +331,44 @@ impl Service {
             }
         }
         self.unlock_quiet_until = Some(Instant::now() + UNLOCK_QUIET);
+        false
+    }
+
+    /// Log the Bitwarden CLI in with an API key (it cannot decrypt the vault).
+    async fn log_in(&mut self, ask: &str) -> bool {
+        let mut note = String::new();
+        for _ in 0..3 {
+            let Some(id) = dialog::ask(
+                format!("{ask}\n\n{note}The Bitwarden CLI on this Mac is not logged in. Enter your personal API key's client_id (web vault: Settings > Security > Keys > View API key)."),
+                false,
+                "Next",
+                UNLOCK_DIALOG_TIMEOUT,
+            )
+            .await
+            else {
+                return false;
+            };
+            let Some(secret) = dialog::ask(
+                "Enter the API key's client_secret.".to_string(),
+                true,
+                "Log in",
+                UNLOCK_DIALOG_TIMEOUT,
+            )
+            .await
+            else {
+                return false;
+            };
+            match self.vault.log_in(id.trim(), secret.trim()).await {
+                Ok(()) => {
+                    info!("bw logged in");
+                    return true;
+                }
+                Err(e) => {
+                    warn!("bw login failed: {e}");
+                    note = format!("Login failed: {e}\n\n");
+                }
+            }
+        }
         false
     }
 
@@ -379,6 +425,16 @@ impl Service {
                     }
                 };
                 let device = self.device_label(&identity);
+                if ask.what == crate::provision::MARKER {
+                    // The pairing check aac-touchid itself sends; nothing to release.
+                    self.record(&device, "pairing", "paired");
+                    let _ = reply.send(CredentialRequestReply {
+                        approved: false,
+                        credential: None,
+                        credential_id: None,
+                    });
+                    return;
+                }
                 let who = requester(ask.agent.as_deref(), &device);
                 let what = query_label(&query);
                 let deny = |reply: tokio::sync::oneshot::Sender<CredentialRequestReply>| {
@@ -606,6 +662,8 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             s.relay = "connected".to_string();
         }
         let mut tick = tokio::time::interval(Duration::from_secs(60));
+        let mut provision = tokio::time::interval(PROVISION_EVERY);
+        let provisioning = Arc::new(tokio::sync::Mutex::new(()));
         let revoke = loop {
             tokio::select! {
                 n = notifications.recv() => match n {
@@ -637,6 +695,16 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     None => {}
                 },
                 _ = tick.tick() => svc.maybe_idle_lock().await,
+                _ = provision.tick() => {
+                    // First tick fires at once: pair right after connecting.
+                    let (targets, client, dir, gate) =
+                        (svc.cfg.targets.clone(), client.clone(), dir.clone(), provisioning.clone());
+                    tokio::spawn(async move {
+                        if let Ok(_g) = gate.try_lock() {
+                            crate::provision::ensure_all(&targets, &client, &dir).await;
+                        }
+                    });
+                }
                 _ = term.recv() => {
                     svc.lock("shutdown").await;
                     return Ok(());
