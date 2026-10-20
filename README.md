@@ -13,7 +13,11 @@ aac run --domain "github.com | pi · homelab | check gh login" --env GH_TOKEN=pa
 The request travels end to end encrypted through the Agent Access relay to this listener on your Mac. The listener looks up the item with the Bitwarden CLI (`bw`) and shows a system sheet:
 
 > **Bitwarden**
-> Bitwarden is trying to let **𝗽𝗶 · 𝗵𝗼𝗺𝗲𝗹𝗮𝗯** (nuc) use **𝗚𝗶𝘁𝗛𝘂𝗯** (you@example.com): check gh login.
+> Bitwarden is trying to share a password
+>
+> **𝗽𝗶 · 𝗵𝗼𝗺𝗲𝗹𝗮𝗯** (nuc)
+> **𝗚𝗶𝘁𝗛𝘂𝗯** (you@example.com)
+> check gh login
 
 The sheet has no rich text, so the agent and item names use Unicode mathematical bold letters. macOS titles the sheet with the program's name, so the prompt runs through a link named `Bitwarden`.
 

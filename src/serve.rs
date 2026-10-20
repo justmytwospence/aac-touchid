@@ -180,7 +180,8 @@ pub fn requester(agent: Option<&str>, device: &str) -> String {
     }
 }
 
-/// Completes `Bitwarden is trying to <reason>.`
+/// The sheet reads `Bitwarden is trying to share a password`, then one line
+/// each: who (bold), which item (bold), and why.
 pub fn credential_reason(
     who: &str,
     item: &str,
@@ -192,14 +193,14 @@ pub fn credential_reason(
         _ => String::new(),
     };
     format!(
-        "let {who} use {}{user}: {}",
+        "share a password\n\n{who}\n{}{user}\n{}",
         bold(item),
         why.unwrap_or("no reason given")
     )
 }
 
 pub fn pairing_reason(device: &str, code: &str) -> String {
-    format!("pair {} as a new device (check code {code})", bold(device))
+    format!("pair a new device\n\n{}\ncheck code {code}", bold(device))
 }
 
 /// Per-device denial memory.
@@ -268,13 +269,13 @@ impl Service {
         if self.unlock_quiet_until.is_some_and(|t| Instant::now() < t) {
             return false;
         }
-        let ask = match why {
-            Some(why) => format!("{who} wants {}: {why}", bold(what)),
-            None => format!("{who} wants {}", bold(what)),
-        };
-        let mut message = format!(
-            "{ask}\n\nEnter your Bitwarden master password to unlock. You will approve each request with Touch ID."
+        let ask = format!(
+            "{who}\n{}\n{}",
+            bold(what),
+            why.unwrap_or("no reason given")
         );
+        let mut message =
+            format!("{ask}\n\nEnter your Bitwarden master password to unlock agent requests.");
         for _ in 0..3 {
             let Some(password) =
                 dialog::ask_master_password(message.clone(), UNLOCK_DIALOG_TIMEOUT).await
@@ -643,17 +644,17 @@ mod tests {
         assert_eq!(
             credential_reason(&who, "GitHub", Some("me@x.com"), Some("log in with gh")),
             format!(
-                "let {who} use {} (me@x.com): log in with gh",
+                "share a password\n\n{who}\n{} (me@x.com)\nlog in with gh",
                 bold("GitHub")
             )
         );
         assert_eq!(
             credential_reason("n", "x", None, None),
-            "let n use \u{1D605}: no reason given"
+            "share a password\n\nn\n\u{1D605}\nno reason given"
         );
         assert_eq!(
             pairing_reason("nuc", "ab12cd"),
-            format!("pair {} as a new device (check code ab12cd)", bold("nuc"))
+            format!("pair a new device\n\n{}\ncheck code ab12cd", bold("nuc"))
         );
     }
 
