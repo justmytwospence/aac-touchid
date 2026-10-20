@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aac-touchid"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ap-client",
  "ap-noise",
@@ -14,6 +14,7 @@ dependencies = [
  "clap",
  "dirs",
  "hex",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-local-authentication",

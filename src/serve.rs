@@ -33,6 +33,8 @@ const DENY_QUIET: Duration = Duration::from_secs(60);
 const UNLOCK_QUIET: Duration = Duration::from_secs(120);
 const UNLOCK_DIALOG_TIMEOUT: Duration = Duration::from_secs(90);
 const RECENT: usize = 10;
+/// How long a code from `aac-touchid pair` can complete a pairing.
+const PAIR_WINDOW: Duration = Duration::from_secs(300);
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -47,7 +49,7 @@ struct Shared {
     relay: String,
     recent: VecDeque<Decision>,
     /// Name given to the most recent `pair` request, used for the next new device.
-    pending_name: Option<String>,
+    pending_name: Option<(String, Instant)>,
     client: Option<UserClient>,
 }
 
@@ -121,6 +123,20 @@ pub struct Ask {
     pub why: Option<String>,
 }
 
+/// An agent's self-reported name: letters, digits, spaces and `· . - _ / @`
+/// only, so it cannot fake a device suffix, line breaks or other sheet text.
+fn clean_agent(s: &str) -> Option<String> {
+    let s: String = s
+        .chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, ' ' | '\u{b7}' | '.' | '-' | '_' | '/' | '@')
+        })
+        .take(40)
+        .collect();
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!s.is_empty()).then_some(s)
+}
+
 fn clean(s: &str, max: usize) -> Option<String> {
     let s: String = s
         .trim()
@@ -137,7 +153,7 @@ pub fn parse_ask(raw: &str) -> Ask {
     match (parts.next(), parts.next()) {
         (Some(agent), Some(why)) => Ask {
             what,
-            agent: clean(agent, 40),
+            agent: clean_agent(agent),
             why: clean(why, 80),
         },
         (Some(why), None) => Ask {
@@ -168,10 +184,6 @@ pub fn bold(s: &str) -> String {
         .collect()
 }
 
-/// The program name macOS shows as the sheet's title and at the start of its
-/// sentence (`"<name>" is trying to <reason>.`).
-pub const SHEET_NAME: &str = "Bitwarden";
-
 /// Who is asking: `agent (device)` with the agent in bold, or the device in bold.
 pub fn requester(agent: Option<&str>, device: &str) -> String {
     match agent {
@@ -186,6 +198,7 @@ pub fn credential_reason(
     who: &str,
     item: &str,
     username: Option<&str>,
+    fields: &str,
     why: Option<&str>,
 ) -> String {
     let user = match username {
@@ -193,14 +206,26 @@ pub fn credential_reason(
         _ => String::new(),
     };
     format!(
-        "share a password\n\n{who}\n{}{user}\n{}",
+        "share a {fields}\n\n{who}\n{}{user}\n{}",
         bold(item),
         why.unwrap_or("no reason given")
     )
 }
 
-pub fn pairing_reason(device: &str, code: &str) -> String {
-    format!("pair a new device\n\n{}\ncheck code {code}", bold(device))
+pub fn pairing_reason(device: &str, issued_secs_ago: u64) -> String {
+    format!(
+        "pair a new device\n\n{}\nfrom the pairing code issued {} ago",
+        bold(device),
+        ago(issued_secs_ago)
+    )
+}
+
+fn ago(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs} s")
+    } else {
+        format!("{} min", secs / 60)
+    }
 }
 
 /// Per-device denial memory.
@@ -253,11 +278,11 @@ impl Service {
         shared(&self.shared).unlocked = self.vault.is_unlocked();
     }
 
-    fn lock(&mut self, why: &str) {
+    async fn lock(&mut self, why: &str) {
         if self.vault.is_unlocked() {
             info!("locking vault: {why}");
         }
-        self.vault.lock();
+        self.vault.lock().await;
         self.set_unlocked();
     }
 
@@ -283,7 +308,7 @@ impl Service {
                 self.unlock_quiet_until = Some(Instant::now() + UNLOCK_QUIET);
                 return false;
             };
-            match self.vault.unlock(&password) {
+            match self.vault.unlock(&password).await {
                 Ok(()) => {
                     info!("vault unlocked");
                     self.unlock_quiet_until = None;
@@ -306,13 +331,24 @@ impl Service {
             UserClientRequest::VerifyFingerprint {
                 fingerprint, reply, ..
             } => {
-                let name = shared(&self.shared)
-                    .pending_name
-                    .take()
-                    .unwrap_or_else(|| "new device".to_string());
+                let _ = fingerprint;
+                let pending = shared(&self.shared).pending_name.take();
+                let Some((name, issued)) = pending.filter(|(_, at)| at.elapsed() < PAIR_WINDOW)
+                else {
+                    // No `aac-touchid pair` in the last 5 minutes: nothing to approve.
+                    self.record(
+                        "unknown device",
+                        "pairing",
+                        "refused (no pairing code issued)",
+                    );
+                    let _ = reply.send(FingerprintVerificationReply {
+                        approved: false,
+                        name: None,
+                    });
+                    return;
+                };
                 let outcome = touchid::confirm(
-                    Some(SHEET_NAME),
-                    pairing_reason(&name, &fingerprint),
+                    pairing_reason(&name, issued.elapsed().as_secs()),
                     self.cfg.approval_timeout,
                 )
                 .await;
@@ -361,10 +397,10 @@ impl Service {
                     self.quiet.note_denied(identity, &what);
                     return deny(reply);
                 }
-                let (credential, item_name) = match self.vault.lookup(&query) {
-                    Lookup::Found(c, name) => (c, name),
+                let (credential, item_name, fields) = match self.vault.lookup(&query).await {
+                    Lookup::Found(c, name, fields) => (c, name, fields),
                     Lookup::Locked => {
-                        self.lock("bw reported the session invalid");
+                        self.lock("bw reported the vault locked").await;
                         self.record(&device, &what, "denied (vault locked)");
                         return deny(reply);
                     }
@@ -395,10 +431,10 @@ impl Service {
                     &who,
                     &item,
                     credential.username.as_deref(),
+                    fields.describe(),
                     ask.why.as_deref(),
                 );
-                let outcome =
-                    touchid::confirm(Some(SHEET_NAME), reason, self.cfg.approval_timeout).await;
+                let outcome = touchid::confirm(reason, self.cfg.approval_timeout).await;
                 self.last_activity = Instant::now();
                 if outcome == Outcome::Approved {
                     self.record(
@@ -423,9 +459,9 @@ impl Service {
         }
     }
 
-    fn maybe_idle_lock(&mut self) {
+    async fn maybe_idle_lock(&mut self) {
         if self.vault.is_unlocked() && self.last_activity.elapsed() >= self.cfg.lock_after {
-            self.lock("idle timeout");
+            self.lock("idle timeout").await;
         }
     }
 }
@@ -477,7 +513,7 @@ async fn control_handler(
                         let name = name.unwrap_or_else(|| "new device".to_string());
                         match client.get_rendezvous_token(Some(name.clone())).await {
                             Ok(code) => {
-                                shared(&shared_state).pending_name = Some(name);
+                                shared(&shared_state).pending_name = Some((name, Instant::now()));
                                 Response {
                                     ok: true,
                                     code: Some(code.as_str().to_string()),
@@ -552,7 +588,7 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 shared(&shared_state).relay = format!("connect failed: {e}");
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = term.recv() => { svc.lock("shutdown"); return Ok(()); }
+                    _ = term.recv() => { svc.lock("shutdown").await; return Ok(()); }
                 }
                 backoff = (backoff * 2).min(Duration::from_secs(120));
                 continue;
@@ -594,15 +630,15 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 c = loop_rx.recv() => match c {
                     Some(LoopCmd::Lock(reply)) => {
-                        svc.lock("requested");
+                        svc.lock("requested").await;
                         let _ = reply.send(Response::ok("locked"));
                     }
                     Some(LoopCmd::Revoke(name, reply)) => break Some((name, reply)),
                     None => {}
                 },
-                _ = tick.tick() => svc.maybe_idle_lock(),
+                _ = tick.tick() => svc.maybe_idle_lock().await,
                 _ = term.recv() => {
-                    svc.lock("shutdown");
+                    svc.lock("shutdown").await;
                     return Ok(());
                 }
             }
@@ -642,19 +678,49 @@ mod tests {
         assert_eq!(who, format!("{} (nuc)", bold("pi \u{b7} homelab")));
         assert_eq!(requester(None, "nuc"), bold("nuc"));
         assert_eq!(
-            credential_reason(&who, "GitHub", Some("me@x.com"), Some("log in with gh")),
+            credential_reason(
+                &who,
+                "GitHub",
+                Some("me@x.com"),
+                "password + 2FA code",
+                Some("log in with gh")
+            ),
             format!(
-                "share a password\n\n{who}\n{} (me@x.com)\nlog in with gh",
+                "share a password + 2FA code\n\n{who}\n{} (me@x.com)\nlog in with gh",
                 bold("GitHub")
             )
         );
         assert_eq!(
-            credential_reason("n", "x", None, None),
+            credential_reason("n", "x", None, "password", None),
             "share a password\n\nn\n\u{1D605}\nno reason given"
         );
         assert_eq!(
-            pairing_reason("nuc", "ab12cd"),
-            format!("pair a new device\n\n{}\ncheck code ab12cd", bold("nuc"))
+            pairing_reason("nuc", 75),
+            format!(
+                "pair a new device\n\n{}\nfrom the pairing code issued 1 min ago",
+                bold("nuc")
+            )
+        );
+    }
+
+    #[test]
+    fn agent_names_cannot_fake_devices_or_lines() {
+        assert_eq!(
+            clean_agent("pi \u{b7} homelab").as_deref(),
+            Some("pi \u{b7} homelab")
+        );
+        assert_eq!(clean_agent("pi (mac-air)").as_deref(), Some("pi mac-air"));
+        assert_eq!(clean_agent("a\nb\u{202e}c\"d").as_deref(), Some("abcd"));
+        assert_eq!(
+            clean_agent("\u{1D5D4}\u{1D5D5}"),
+            None,
+            "no lookalike letters"
+        );
+        assert_eq!(clean_agent("x   y").as_deref(), Some("x y"));
+        assert_eq!(clean_agent(&"z".repeat(90)).map(|s| s.len()), Some(40));
+        assert_eq!(
+            parse_ask("g.com | pi (mac) | why").agent.as_deref(),
+            Some("pi mac")
         );
     }
 

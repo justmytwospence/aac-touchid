@@ -19,7 +19,7 @@ The request travels end to end encrypted through the Agent Access relay to this 
 > **𝗚𝗶𝘁𝗛𝘂𝗯** (you@example.com)
 > check gh login
 
-The sheet has no rich text, so the agent and item names use Unicode mathematical bold letters. macOS titles the sheet with the program's name, so the prompt runs through a link named `Bitwarden`.
+The sheet has no rich text, so the agent and item names use Unicode mathematical bold letters. macOS titles the sheet with the program's file name, so install a copy of the binary named `Bitwarden` for the service to run (see below). The sheet also says what is released: `password`, `password + 2FA code`, or `username only`. Notes are never released, because they can hold recovery codes.
 
 If you touch the sensor, the secret goes to that device and into the command's environment. If you cancel or don't answer within 60 s, the agent gets `aac` exit code 4 ("Request denied").
 
@@ -37,7 +37,7 @@ It replaces the interactive `aac listen` terminal app. There is nothing to keep 
 
 ```xml
 <key>ProgramArguments</key>
-<array><string>/Users/you/.local/bin/aac-touchid</string><string>serve</string></array>
+<array><string>/Users/you/.local/libexec/aac-touchid/Bitwarden</string><string>serve</string></array>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>
 <key>EnvironmentVariables</key>
@@ -64,14 +64,16 @@ Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents
 - Every credential needs a biometric or Watch approval (LocalAuthentication `deviceOwnerAuthenticationWithBiometricsOrCompanion`, password fallback hidden). The sheet names the agent (self-reported) and its device (verified), the vault item, the username and the agent's stated reason.
 - Only paired devices can ask. Pairing needs a code from `aac-touchid pair` and a Touch ID approval of the device's verification code. A code an agent obtains alone does not pair anything.
 - After a denial, the same device asking for the same item is denied silently for 60 s, and a cancelled unlock dialog is not shown again for 2 minutes, so an agent cannot spam prompts.
-- The Bitwarden session key lives only in this process's memory. It and the master password reach `bw` only as the environment of short-lived child processes. Locking runs `bw lock`, so a leaked session key stops working.
+- No secret ever goes into an environment variable or a command line, where any process of the same user can read it (`ps -E`). The listener runs one `bw serve` child on a private socket pair (`--hostname fd+connected://3`, a supported `bw serve` mode) that no other process can open; the master password travels once in its `POST /unlock` body and the vault key stays inside that child. Locking calls `/lock` and stops the child.
+- Only username, password, URI and the current 2FA code (never the TOTP seed) are released.
+- Agent names are reduced to letters, digits, spaces and `· . - _ / @`, so a name cannot fake a device suffix or extra lines. Pairing completes only within 5 minutes of `aac-touchid pair`, and the sheet names the device and when its code was issued.
 - The relay sees only device fingerprints and timing (Noise protocol, end to end).
 
 Not covered:
 
 - An approved command holds that secret and can misuse it. Approve only requests you expect.
 - The sheet cannot show an agent's purpose; what the agent says in its session is its own claim.
-- A malicious process running as your macOS user can attack your account by other routes (replace this binary, read a `bw` child's environment during a lookup, or show a fake password dialog). It still cannot touch the sensor for you. Run agents you don't trust on another machine or as another user.
+- A malicious process running as your macOS user, outside any sandbox, can still attack your account by other routes: replace this binary or its LaunchAgent and wait for you to unlock it, or show a fake password dialog. It still cannot touch the sensor for you. Agent sandboxes that keep agents from writing outside their project close those routes; run agents you don't trust on another machine or as another user.
 - Agent Access is an early alpha protocol, and Bitwarden runs the default relay (`wss://ap.lesspassword.dev`) for development use.
 
 ## Build

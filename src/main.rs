@@ -56,25 +56,10 @@ enum Command {
     Lock,
     /// Forget a paired device by name (or fingerprint prefix).
     Revoke { name: String },
-    /// Internal: show one Touch ID sheet. The service runs this through a link
-    /// named after the requesting agent, because macOS titles the sheet with the
-    /// executable's name. Exit 0 approved, 10 denied, 11 timed out, 12 unavailable.
-    #[command(hide = true)]
-    Prompt {
-        #[arg(long, default_value_t = 60)]
-        timeout: u64,
-        reason: String,
-    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Command::Prompt { timeout, reason } = &cli.command {
-        return ExitCode::from(touchid::prompt_exit_code(
-            reason,
-            Duration::from_secs(*timeout),
-        ));
-    }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -117,7 +102,6 @@ fn main() -> ExitCode {
             Command::Status { json } => client(control::Request::Status, json).await,
             Command::Lock => client(control::Request::Lock, false).await,
             Command::Revoke { name } => client(control::Request::Revoke { name }, false).await,
-            Command::Prompt { .. } => ExitCode::FAILURE,
         }
     })
 }
