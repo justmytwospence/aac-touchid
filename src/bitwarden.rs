@@ -56,6 +56,39 @@ impl Fields {
     }
 }
 
+/// One vault item named by a search, as bw serve returns it.
+#[derive(Debug)]
+pub enum Resolved {
+    Item(Value),
+    NotFound,
+    /// Several logins match; the requester must ask by item id.
+    Ambiguous(usize),
+    Locked,
+    Error(String),
+}
+
+/// The folder every agent-created login goes in. Only its logins may get a
+/// 2FA seed from an agent.
+pub const AGENT_FOLDER: &str = "Agent-created";
+
+/// A login to create.
+pub struct NewLogin<'a> {
+    pub name: &'a str,
+    pub username: Option<&'a str>,
+    pub password: &'a str,
+    pub uri: Option<&'a str>,
+    pub folder_id: &'a str,
+    pub notes: &'a str,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TotpWrite {
+    Stored,
+    /// The login has a seed already; it is never overwritten.
+    AlreadySet,
+    NotLogin,
+}
+
 #[derive(Deserialize)]
 struct BwItem {
     id: Option<String>,
@@ -252,44 +285,55 @@ impl Vault {
         self.unlocked = false;
     }
 
-    pub async fn lookup(&mut self, query: &CredentialQuery) -> Lookup {
+    /// Mark the vault locked when bw says so, and turn a failed reply into
+    /// its message.
+    fn check(&mut self, reply: &Value) -> Result<(), String> {
+        if reply["success"].as_bool() == Some(true) {
+            return Ok(());
+        }
+        let message = reply["message"].as_str().unwrap_or("bw request failed");
+        if message.contains("locked") {
+            self.unlocked = false;
+        }
+        Err(message.to_string())
+    }
+
+    /// Find the one vault item a search names: by id, name or domain, then
+    /// by exact login URI host when several match.
+    pub async fn resolve(&mut self, search: &str) -> Resolved {
         if self.bw.is_none() {
-            return Lookup::Error("Bitwarden CLI (bw) not found".to_string());
+            return Resolved::Error("Bitwarden CLI (bw) not found".to_string());
         }
         if !self.unlocked {
-            return Lookup::Locked;
+            return Resolved::Locked;
         }
-        let search = query.search_string().to_string();
-        let reply = match self
-            .call("GET", &format!("/object/item/{}", pct(&search)), None)
+        let mut reply = match self
+            .call("GET", &format!("/object/item/{}", pct(search)), None)
             .await
         {
             Ok(v) => v,
-            Err(e) => return Lookup::Error(e),
+            Err(e) => return Resolved::Error(e),
         };
         if reply["success"].as_bool() == Some(true) {
-            return match serde_json::from_value::<BwItem>(reply["data"].clone()) {
-                Ok(item) => self.credential_from(item).await,
-                Err(e) => Lookup::Error(format!("parse item: {e}")),
-            };
+            return Resolved::Item(reply["data"].take());
         }
-        let message = reply["message"].as_str().unwrap_or_default();
+        let message = reply["message"].as_str().unwrap_or_default().to_string();
         if message.contains("More than one result") {
-            return self.lookup_by_url(&search).await;
+            return self.resolve_by_url(search).await;
         }
         if message.contains("Not found") {
-            return Lookup::NotFound;
+            return Resolved::NotFound;
         }
         if message.contains("locked") {
             self.unlocked = false;
-            return Lookup::Locked;
+            return Resolved::Locked;
         }
-        Lookup::Error(message.to_string())
+        Resolved::Error(message)
     }
 
     /// Disambiguate a domain by exact login URI host.
-    async fn lookup_by_url(&mut self, domain: &str) -> Lookup {
-        let reply = match self
+    async fn resolve_by_url(&mut self, domain: &str) -> Resolved {
+        let mut reply = match self
             .call(
                 "GET",
                 &format!("/list/object/items?search={}", pct(domain)),
@@ -298,29 +342,229 @@ impl Vault {
             .await
         {
             Ok(v) => v,
-            Err(e) => return Lookup::Error(e),
+            Err(e) => return Resolved::Error(e),
         };
-        let items: Vec<BwItem> =
-            serde_json::from_value(reply["data"]["data"].clone()).unwrap_or_default();
-        let mut matches: Vec<BwItem> = items
-            .into_iter()
-            .filter(|i| {
-                i.login.as_ref().is_some_and(|l| {
-                    l.uris
-                        .iter()
-                        .flatten()
-                        .any(|u| u.uri.as_deref().and_then(host_of).as_deref() == Some(domain))
-                })
-            })
-            .collect();
-        match matches.len() {
-            0 => Lookup::NotFound,
-            1 => match matches.pop() {
-                Some(item) => self.credential_from(item).await,
-                None => Lookup::NotFound,
+        let mut items = match reply["data"]["data"].take() {
+            Value::Array(items) => items,
+            _ => Vec::new(),
+        };
+        wipe(&mut reply);
+        items.retain(|i| login_hosts(i).any(|h| h == domain));
+        let found = match items.len() {
+            0 => Resolved::NotFound,
+            1 => items.pop().map_or(Resolved::NotFound, Resolved::Item),
+            n => Resolved::Ambiguous(n),
+        };
+        items.iter_mut().for_each(wipe);
+        found
+    }
+
+    pub async fn lookup(&mut self, query: &CredentialQuery) -> Lookup {
+        match self.resolve(query.search_string()).await {
+            Resolved::Item(v) => match serde_json::from_value::<BwItem>(v) {
+                Ok(item) => self.credential_from(item).await,
+                Err(e) => Lookup::Error(format!("parse item: {e}")),
             },
-            n => Lookup::Ambiguous(n),
+            Resolved::NotFound => Lookup::NotFound,
+            Resolved::Ambiguous(n) => Lookup::Ambiguous(n),
+            Resolved::Locked => Lookup::Locked,
+            Resolved::Error(e) => Lookup::Error(e),
         }
+    }
+
+    /// A password from bw's generator: upper, lower, digits, and symbols
+    /// unless turned off. bw reads any present boolean option as true, so
+    /// `special` is left out rather than set to false.
+    pub async fn generate(
+        &mut self,
+        length: u32,
+        symbols: bool,
+    ) -> Result<Zeroizing<String>, String> {
+        let mut path =
+            format!("/generate?length={length}&uppercase=true&lowercase=true&number=true");
+        if symbols {
+            path.push_str("&special=true");
+        }
+        let mut reply = self.call("GET", &path, None).await?;
+        self.check(&reply)?;
+        let password = match reply["data"]["data"].take() {
+            Value::String(s) => Zeroizing::new(s),
+            _ => return Err("bw generate returned no password".to_string()),
+        };
+        // Organization policies may lengthen it, never shorten it.
+        if password.chars().count() < length as usize {
+            return Err("bw generated a shorter password than asked".to_string());
+        }
+        Ok(password)
+    }
+
+    /// Ids of the folders named [`AGENT_FOLDER`].
+    async fn agent_folder_ids(&mut self) -> Result<Vec<String>, String> {
+        let reply = self
+            .call(
+                "GET",
+                &format!("/list/object/folders?search={}", pct(AGENT_FOLDER)),
+                None,
+            )
+            .await?;
+        self.check(&reply)?;
+        Ok(reply["data"]["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|f| f["name"].as_str() == Some(AGENT_FOLDER))
+            .filter_map(|f| f["id"].as_str().map(String::from))
+            .collect())
+    }
+
+    /// The folder agent-created logins go in; created on first use when
+    /// `create` is set.
+    pub async fn agent_folder(&mut self, create: bool) -> Result<Option<String>, String> {
+        if let Some(id) = self.agent_folder_ids().await?.into_iter().next() {
+            return Ok(Some(id));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let body = serde_json::to_vec(&serde_json::json!({ "name": AGENT_FOLDER }))
+            .map_err(|e| e.to_string())?;
+        let reply = self.call("POST", "/object/folder", Some(&body)).await?;
+        self.check(&reply)?;
+        reply["data"]["id"]
+            .as_str()
+            .map(|id| Some(id.to_string()))
+            .ok_or_else(|| "bw created a folder without an id".to_string())
+    }
+
+    /// Whether an item is in a folder named [`AGENT_FOLDER`].
+    pub async fn in_agent_folder(&mut self, item: &Value) -> Result<bool, String> {
+        let Some(folder) = item["folderId"].as_str() else {
+            return Ok(false);
+        };
+        Ok(self.agent_folder_ids().await?.iter().any(|id| id == folder))
+    }
+
+    /// Whether the vault already has an item with this name (exact, any
+    /// case) or a login for this host.
+    pub async fn exists(&mut self, name: &str, host: Option<&str>) -> Result<bool, String> {
+        let mut searches = vec![name];
+        if let Some(h) = host.filter(|h| !h.eq_ignore_ascii_case(name)) {
+            searches.push(h);
+        }
+        for search in searches {
+            let mut reply = self
+                .call(
+                    "GET",
+                    &format!("/list/object/items?search={}", pct(search)),
+                    None,
+                )
+                .await?;
+            let checked = self.check(&reply);
+            let hit = reply["data"]["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|i| {
+                    i["name"]
+                        .as_str()
+                        .is_some_and(|n| n.trim().eq_ignore_ascii_case(name))
+                        || host.is_some_and(|h| login_hosts(i).any(|x| x == h))
+                });
+            wipe(&mut reply);
+            checked?;
+            if hit {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Create a login in `folder_id`. Returns the new item's id.
+    pub async fn create_login(&mut self, new: &NewLogin<'_>) -> Result<String, String> {
+        let uris: Vec<Value> = new
+            .uri
+            .map(|u| serde_json::json!({ "match": null, "uri": u }))
+            .into_iter()
+            .collect();
+        let mut item = serde_json::json!({
+            "organizationId": null,
+            "collectionIds": null,
+            "folderId": new.folder_id,
+            "type": 1,
+            "name": new.name,
+            "notes": new.notes,
+            "favorite": false,
+            "fields": [],
+            "reprompt": 0,
+            "login": {
+                "uris": uris,
+                "username": new.username,
+                "password": new.password,
+                "totp": null,
+            },
+        });
+        let body = serde_json::to_vec(&item).map_err(|e| e.to_string());
+        wipe(&mut item);
+        let mut body = Zeroizing::new(body?);
+        let reply = self.call("POST", "/object/item", Some(&body)).await;
+        body.zeroize();
+        let mut reply = reply?;
+        let checked = self.check(&reply);
+        let id = reply["data"]["id"].as_str().map(String::from);
+        wipe(&mut reply);
+        checked?;
+        id.ok_or_else(|| "bw created an item without an id".to_string())
+    }
+
+    /// Store a TOTP seed on a login that has none. Reads the item again
+    /// first, so a seed set since the approval is never overwritten.
+    pub async fn set_totp(&mut self, id: &str, seed: &str) -> Result<TotpWrite, String> {
+        let path = format!("/object/item/{}", pct(id));
+        let mut reply = self.call("GET", &path, None).await?;
+        let checked = self.check(&reply);
+        let mut item = reply["data"].take();
+        wipe(&mut reply);
+        if let Err(e) = checked {
+            wipe(&mut item);
+            return Err(e);
+        }
+        if item["type"].as_i64() != Some(1) || !item["login"].is_object() {
+            wipe(&mut item);
+            return Ok(TotpWrite::NotLogin);
+        }
+        if item["login"]["totp"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty())
+        {
+            wipe(&mut item);
+            return Ok(TotpWrite::AlreadySet);
+        }
+        item["login"]["totp"] = Value::String(seed.to_string());
+        let body = serde_json::to_vec(&item).map_err(|e| e.to_string());
+        wipe(&mut item);
+        let mut body = Zeroizing::new(body?);
+        let reply = self.call("PUT", &path, Some(&body)).await;
+        body.zeroize();
+        let mut reply = reply?;
+        let checked = self.check(&reply);
+        let stored = reply["data"]["login"]["totp"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty());
+        wipe(&mut reply);
+        checked?;
+        if stored {
+            Ok(TotpWrite::Stored)
+        } else {
+            Err("bw did not store the 2FA seed".to_string())
+        }
+    }
+
+    /// The current TOTP code of an item, never its seed.
+    pub async fn totp_code(&mut self, id: &str) -> Option<String> {
+        self.call("GET", &format!("/object/totp/{}", pct(id)), None)
+            .await
+            .ok()
+            .and_then(|v| v["data"]["data"].as_str().map(String::from))
     }
 
     async fn credential_from(&mut self, item: BwItem) -> Lookup {
@@ -334,11 +578,7 @@ impl Vault {
             .or_else(|| item.name.clone());
         // The vault stores the TOTP seed; release only the current code.
         let totp = match (&login.totp, &item.id) {
-            (Some(_), Some(id)) => self
-                .call("GET", &format!("/object/totp/{}", pct(id)), None)
-                .await
-                .ok()
-                .and_then(|v| v["data"]["data"].as_str().map(String::from)),
+            (Some(_), Some(id)) => self.totp_code(id).await,
             _ => None,
         };
         let fields = Fields {
@@ -440,6 +680,26 @@ async fn roundtrip(
             .map_err(|e| format!("read: {e}"))?;
     }
     serde_json::from_slice(&data).map_err(|e| format!("parse reply: {e}"))
+}
+
+/// Hosts of a vault item's login URIs.
+pub fn login_hosts(item: &Value) -> impl Iterator<Item = String> + '_ {
+    item["login"]["uris"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|u| u["uri"].as_str().and_then(host_of))
+}
+
+/// Overwrite every string in a JSON value before it is dropped: bw replies
+/// and request templates carry passwords and seeds.
+pub fn wipe(v: &mut Value) {
+    match v {
+        Value::String(s) => s.zeroize(),
+        Value::Array(a) => a.iter_mut().for_each(wipe),
+        Value::Object(o) => o.values_mut().for_each(wipe),
+        _ => {}
+    }
 }
 
 /// Percent-encode a path segment or query value.
@@ -547,8 +807,10 @@ mod tests {
         let fake = dir.join("bw");
         std::fs::write(
             &fake,
-            concat!("#!/usr/bin/env python3\n", r#"import os, socket, json, sys
+            concat!("#!/usr/bin/env python3\n", r#"import os, socket, json, sys, urllib.parse
 s = socket.socket(fileno=3)
+folders = []
+items = {"i1": {"id": "i1", "type": 1, "folderId": None, "name": "GitHub", "notes": "RECOVERY", "login": {"username": "me", "password": "pw", "totp": "SEED", "uris": [{"uri": "https://github.com/login"}]}}}
 leak = any("hunter2" in v for v in os.environ.values()) or any("hunter2" in a for a in sys.argv)
 f = s.makefile("rb")
 while True:
@@ -564,12 +826,43 @@ while True:
         if h.lower().startswith("content-length:"):
             n = int(h.split(":")[1])
     body = f.read(n) if n else b""
-    if path == "/unlock":
+    route, _, query = path.partition("?")
+    q = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+    def hit(i, term):
+        term = urllib.parse.unquote(term).lower()
+        return term in i["name"].lower() or any(term in u["uri"] for u in i["login"]["uris"])
+    if route == "/unlock":
         ok = json.loads(body)["password"] == "hunter2" and not leak
         out = {"success": True, "data": {"raw": "SESSIONKEY"}} if ok else {"success": False, "message": "Invalid master password."}
-    elif path.startswith("/object/item/"):
-        out = {"success": True, "data": {"id": "i1", "name": "GitHub", "notes": "RECOVERY", "login": {"username": "me", "password": "pw", "totp": "SEED", "uris": [{"uri": "https://github.com/login"}]}}}
-    elif path.startswith("/object/totp/"):
+    elif route == "/generate":
+        if q.get("special") != "true" and "special" in q:
+            out = {"success": False, "message": "special must be left out, not false"}
+        else:
+            pw = "A" * int(q["length"]) + ("!" if "special" in q else "")
+            out = {"success": True, "data": {"object": "string", "data": pw}}
+    elif route == "/list/object/folders":
+        out = {"success": True, "data": {"object": "list", "data": folders}}
+    elif route == "/object/folder" and method == "POST":
+        folders.append({"object": "folder", "id": "f1", "name": json.loads(body)["name"]})
+        out = {"success": True, "data": folders[-1]}
+    elif route == "/list/object/items":
+        out = {"success": True, "data": {"object": "list", "data": [i for i in items.values() if hit(i, q["search"])]}}
+    elif route == "/object/item" and method == "POST":
+        item = json.loads(body)
+        item["id"] = "n%d" % len(items)
+        items[item["id"]] = item
+        out = {"success": True, "data": item}
+    elif route.startswith("/object/item/") and method == "PUT":
+        item = json.loads(body)
+        items[route.rsplit("/", 1)[1]] = item
+        out = {"success": True, "data": item}
+    elif route.startswith("/object/item/"):
+        key = urllib.parse.unquote(route.rsplit("/", 1)[1])
+        found = items.get(key) or [i for i in items.values() if hit(i, key)]
+        if isinstance(found, list):
+            found = found[0] if len(found) == 1 else None
+        out = {"success": True, "data": found} if found else {"success": False, "message": "Not found."}
+    elif route.startswith("/object/totp/"):
         out = {"success": True, "data": {"object": "string", "data": "123456"}}
     else:
         out = {"success": True}
@@ -610,8 +903,73 @@ while True:
             }
             other => panic!("unexpected {other:?}"),
         }
+
+        // Writes: generator, agent folder, new login, 2FA seed.
+        let pw = v.generate(20, false).await.expect("generate");
+        assert_eq!(pw.as_str(), "A".repeat(20));
+        assert!(v.generate(16, true).await.expect("generate").ends_with('!'));
+        assert_eq!(v.agent_folder(false).await, Ok(None));
+        assert_eq!(v.agent_folder(true).await, Ok(Some("f1".to_string())));
+        assert_eq!(v.agent_folder(false).await, Ok(Some("f1".to_string())));
+        assert_eq!(v.exists("Acme", Some("acme.io")).await, Ok(false));
+        assert_eq!(v.exists("github", None).await, Ok(true));
+        assert_eq!(v.exists("Other", Some("github.com")).await, Ok(true));
+        let id = v
+            .create_login(&NewLogin {
+                name: "Acme",
+                username: Some("bot@x.com"),
+                password: &pw,
+                uri: Some("https://acme.io"),
+                folder_id: "f1",
+                notes: "Created by aac-touchid",
+            })
+            .await
+            .expect("create");
+        assert_eq!(id, "n1");
+        assert_eq!(v.exists("acme", None).await, Ok(true));
+        let Resolved::Item(item) = v.resolve(&id).await else {
+            panic!("new item not found")
+        };
+        assert_eq!(item["login"]["password"], "A".repeat(20));
+        assert_eq!(item["folderId"], "f1");
+        assert_eq!(v.in_agent_folder(&item).await, Ok(true));
+        let Resolved::Item(github) = v.resolve("i1").await else {
+            panic!("github not found")
+        };
+        assert_eq!(v.in_agent_folder(&github).await, Ok(false));
+        assert_eq!(
+            v.set_totp(&id, "JBSWY3DPEHPK3PXP").await,
+            Ok(TotpWrite::Stored)
+        );
+        let Resolved::Item(item) = v.resolve(&id).await else {
+            panic!("item gone")
+        };
+        assert_eq!(item["login"]["totp"], "JBSWY3DPEHPK3PXP");
+        assert_eq!(
+            item["login"]["password"],
+            "A".repeat(20),
+            "PUT keeps the item"
+        );
+        assert_eq!(
+            v.set_totp(&id, "KRSXG5CTMVRXEZLU").await,
+            Ok(TotpWrite::AlreadySet)
+        );
+        assert_eq!(
+            v.set_totp("i1", "KRSXG5CTMVRXEZLU").await,
+            Ok(TotpWrite::AlreadySet)
+        );
+        assert_eq!(v.totp_code(&id).await.as_deref(), Some("123456"));
+        assert!(matches!(v.resolve("nothing").await, Resolved::NotFound));
+
         v.lock().await;
         assert!(!v.is_unlocked());
         assert!(v.serve.is_none());
+    }
+
+    #[test]
+    fn wipe_clears_every_string() {
+        let mut v = serde_json::json!({"a": "pw", "b": [{"c": "seed"}], "d": 1});
+        wipe(&mut v);
+        assert_eq!(v, serde_json::json!({"a": "", "b": [{"c": ""}], "d": 1}));
     }
 }

@@ -135,7 +135,11 @@ pub fn redact(raw: &str) -> String {
     let dropped = head.split_whitespace().count() > usize::from(!item.is_empty());
     let mut out = format!("{}{}", &s[..5], item);
     if dropped {
-        out.push_str(if item.is_empty() { "[redacted]" } else { " [redacted]" });
+        out.push_str(if item.is_empty() {
+            "[redacted]"
+        } else {
+            " [redacted]"
+        });
     }
     if !tail.is_empty() {
         out.push(' ');
@@ -184,9 +188,7 @@ fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
     for (key, value) in options {
         let slot_taken = match key.to_ascii_lowercase().as_str() {
             "user" => {
-                if value.is_empty()
-                    || value.len() > MAX_USER
-                    || value.chars().any(char::is_control)
+                if value.is_empty() || value.len() > MAX_USER || value.chars().any(char::is_control)
                 {
                     return Err(ParseError::BadUser);
                 }
@@ -226,7 +228,9 @@ fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
             return Err(ParseError::DuplicateOption);
         }
     }
-    let uri = url.or_else(|| looks_like_host(&name).then(|| format!("https://{}", name.to_ascii_lowercase())));
+    let uri = url.or_else(|| {
+        looks_like_host(&name).then(|| format!("https://{}", name.to_ascii_lowercase()))
+    });
     Ok(NewLogin {
         name,
         username,
@@ -375,7 +379,14 @@ mod tests {
 
     #[test]
     fn reads_are_unchanged() {
-        for s in ["github.com", "GitHub", "1f0c-uuid", "news.example.com", "totpal.com", ""] {
+        for s in [
+            "github.com",
+            "GitHub",
+            "1f0c-uuid",
+            "news.example.com",
+            "totpal.com",
+            "",
+        ] {
             assert_eq!(parse(s), Ok(Intent::Read), "{s}");
         }
     }
@@ -419,7 +430,9 @@ mod tests {
             }
         );
         assert_eq!(
-            new("new:example.com url=https://login.example.com").uri.as_deref(),
+            new("new:example.com url=https://login.example.com")
+                .uri
+                .as_deref(),
             Some("https://login.example.com"),
             "url wins over the name"
         );
@@ -475,7 +488,11 @@ mod tests {
             format!("otpauth://totp/Acme:me%40x.com?secret={SEED}&issuer=Acme&digits=8")
         );
         assert_eq!(
-            totp(&format!("totp:x uri=OTPAUTH://TOTP/a?issuer=A&secret={SEED}%3D%3D")).seed.as_str(),
+            totp(&format!(
+                "totp:x uri=OTPAUTH://TOTP/a?issuer=A&secret={SEED}%3D%3D"
+            ))
+            .seed
+            .as_str(),
             format!("otpauth://totp/a?secret={SEED}&issuer=A")
         );
     }
@@ -501,11 +518,26 @@ mod tests {
                 format!("totp:x uri=otpauth://totp/a?secret={SEED}&secret={SEED}"),
                 DuplicateSeed,
             ),
-            (format!("totp:x uri=otpauth://hotp/a?secret={SEED}&counter=1"), Hotp),
-            ("totp:x uri=otpauth://totp/a?issuer=A".to_string(), OtpauthWithoutSecret),
-            ("totp:x uri=otpauth://totp/a".to_string(), OtpauthWithoutSecret),
-            (format!("totp:x uri=https://x.com/?secret={SEED}"), BadOtpauth),
-            (format!("totp:x uri=otpauth://totp/a?secret={SEED}%G1"), BadSecret),
+            (
+                format!("totp:x uri=otpauth://hotp/a?secret={SEED}&counter=1"),
+                Hotp,
+            ),
+            (
+                "totp:x uri=otpauth://totp/a?issuer=A".to_string(),
+                OtpauthWithoutSecret,
+            ),
+            (
+                "totp:x uri=otpauth://totp/a".to_string(),
+                OtpauthWithoutSecret,
+            ),
+            (
+                format!("totp:x uri=https://x.com/?secret={SEED}"),
+                BadOtpauth,
+            ),
+            (
+                format!("totp:x uri=otpauth://totp/a?secret={SEED}%G1"),
+                BadSecret,
+            ),
             (format!("totp:x seed={SEED}"), UnknownOption),
             (format!("totp:x secret={SEED} trailing"), UnexpectedText),
         ];
@@ -533,7 +565,10 @@ mod tests {
     #[test]
     fn redaction() {
         assert_eq!(redact("github.com | pi | why"), "github.com | pi | why");
-        assert_eq!(redact("new:x user=me | pi | why"), "new:x user=me | pi | why");
+        assert_eq!(
+            redact("new:x user=me | pi | why"),
+            "new:x user=me | pi | why"
+        );
         assert_eq!(
             redact(&format!("totp:github.com secret={SEED} | pi | enroll")),
             "totp:github.com [redacted] | pi | enroll"
@@ -542,7 +577,10 @@ mod tests {
             redact(&format!(" TOTP:x uri=otpauth://totp/a?secret={SEED}")),
             "TOTP:x [redacted]"
         );
-        assert_eq!(redact(&format!("totp:secret={SEED}|a")), "totp:[redacted] |a");
+        assert_eq!(
+            redact(&format!("totp:secret={SEED}|a")),
+            "totp:[redacted] |a"
+        );
         assert_eq!(redact("totp:x"), "totp:x");
         assert_eq!(redact(&format!("totp:x {SEED}")), "totp:x [redacted]");
         for s in [
