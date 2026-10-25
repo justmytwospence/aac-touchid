@@ -567,6 +567,25 @@ impl Service {
         false
     }
 
+    /// Sync before a write's checks. Records and refuses on failure, since
+    /// the checks would run on a stale vault.
+    async fn sync(&mut self, p: &Pending, what: &str) -> bool {
+        match self.vault.sync().await {
+            Ok(()) => true,
+            Err(e) => {
+                self.vault_error(p, what, &format!("sync: {e}")).await;
+                false
+            }
+        }
+    }
+
+    /// Sync after a write; the write itself is already on the server.
+    async fn after_write(&mut self) {
+        if let Err(e) = self.vault.sync().await {
+            warn!("sync after write failed: {e}");
+        }
+    }
+
     async fn vault_error(&mut self, p: &Pending, what: &str, e: &str) {
         if self.vault.is_unlocked() {
             warn!("vault error: {e}");
@@ -645,7 +664,10 @@ impl Service {
 
     async fn create(&mut self, p: Pending, n: NewLogin, reply: ReplyTx) {
         let what = format!("new {}", n.name);
-        if !self.admit(&p, &what).await || !self.may_create(&p, &what, &n).await {
+        if !self.admit(&p, &what).await
+            || !self.sync(&p, &what).await
+            || !self.may_create(&p, &what, &n).await
+        {
             return deny(reply);
         }
         let reason = create_reason(
@@ -687,6 +709,7 @@ impl Service {
         .await;
         match written {
             Ok((id, password)) => {
+                self.after_write().await;
                 self.record(&p.recipient(), &what, "created");
                 release(
                     reply,
@@ -710,7 +733,7 @@ impl Service {
 
     async fn add_totp(&mut self, p: Pending, t: AddTotp, reply: ReplyTx) {
         let what = format!("2FA {}", t.item);
-        if !self.admit(&p, &what).await {
+        if !self.admit(&p, &what).await || !self.sync(&p, &what).await {
             return deny(reply);
         }
         let mut item = match self.vault.resolve(&t.item).await {
@@ -768,6 +791,7 @@ impl Service {
         }
         match self.vault.set_totp(&id, &t.seed).await {
             Ok(TotpWrite::Stored) => {
+                self.after_write().await;
                 let code = self.vault.totp_code(&id).await;
                 let outcome = if code.is_some() {
                     "2FA added"

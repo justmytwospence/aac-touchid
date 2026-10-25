@@ -59,6 +59,7 @@ Each write shows its own Touch ID sheet. A new login's sheet names the password 
 Guardrails:
 
 - `new:` is refused if an item with that name (any case) or a login for that host already exists, checked before the sheet and again after approval.
+- Writes go straight to the Bitwarden server. The listener syncs its vault before a write's checks (refusing if that fails) and again after the write. Other Bitwarden apps pick up the change by their usual push notification or next sync.
 - New logins go in the folder `Agent-created` (created on first use), with a note naming the agent, device and reason.
 - `totp:` works only on a login that resolves to exactly one item, sits in `Agent-created`, and has no 2FA seed. An agent can never add 2FA to a login you made, and never overwrites a seed; the item is read again after approval to make sure.
 - `totp:` releases only the username and the current code, never the seed or the password.

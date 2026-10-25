@@ -276,6 +276,14 @@ impl Vault {
         Ok(())
     }
 
+    /// Pull the vault from the server. Writes go to the server directly;
+    /// syncing before a write's checks sees items made elsewhere, and after
+    /// it keeps the local copy current.
+    pub async fn sync(&mut self) -> Result<(), String> {
+        let reply = self.call("POST", "/sync", None).await?;
+        self.check(&reply)
+    }
+
     /// Lock the vault and stop `bw serve`, so the key leaves memory too.
     pub async fn lock(&mut self) {
         if self.serve.is_some() {
@@ -913,6 +921,7 @@ while True:
             other => panic!("unexpected {other:?}"),
         }
 
+        assert_eq!(v.sync().await, Ok(()));
         // Writes: generator, agent folder, new login, 2FA seed.
         let pw = v
             .generate(Generator::Password {
