@@ -308,14 +308,18 @@ impl Vault {
         Err(message.to_string())
     }
 
-    /// Find the one vault item a search names: by id, name or domain, then
-    /// by exact login URI host when several match.
+    /// Find the one vault item a search names. A host or URL is matched on
+    /// login URI hosts alone (see [`pick_by_host`]); anything else goes to
+    /// bw's own lookup by id or name, then by exact name when several match.
     pub async fn resolve(&mut self, search: &str) -> Resolved {
         if self.bw.is_none() {
             return Resolved::Error("Bitwarden CLI (bw) not found".to_string());
         }
         if !self.unlocked {
             return Resolved::Locked;
+        }
+        if let Some(host) = host_query(search) {
+            return self.resolve_by_host(&host).await;
         }
         let mut reply = match self
             .call("GET", &format!("/object/item/{}", pct(search)), None)
@@ -329,7 +333,9 @@ impl Vault {
         }
         let message = reply["message"].as_str().unwrap_or_default().to_string();
         if message.contains("More than one result") {
-            return self.resolve_by_url(search).await;
+            return self
+                .resolve_among(search, |items| pick_by_name(items, search))
+                .await;
         }
         if message.contains("Not found") {
             return Resolved::NotFound;
@@ -341,12 +347,24 @@ impl Vault {
         Resolved::Error(message)
     }
 
-    /// Disambiguate a domain by exact login URI host.
-    async fn resolve_by_url(&mut self, domain: &str) -> Resolved {
+    /// Match a host on login URI hosts. bw's search is a substring match on
+    /// names and URIs, so it returns every candidate; the choice is ours.
+    async fn resolve_by_host(&mut self, host: &str) -> Resolved {
+        let search = bare(host).to_string();
+        self.resolve_among(&search, |items| pick_by_host(items, host))
+            .await
+    }
+
+    /// List the items bw finds for `search` and keep the one `pick` chooses.
+    async fn resolve_among(
+        &mut self,
+        search: &str,
+        pick: impl FnOnce(&[Value]) -> Pick,
+    ) -> Resolved {
         let mut reply = match self
             .call(
                 "GET",
-                &format!("/list/object/items?search={}", pct(domain)),
+                &format!("/list/object/items?search={}", pct(search)),
                 None,
             )
             .await
@@ -354,16 +372,23 @@ impl Vault {
             Ok(v) => v,
             Err(e) => return Resolved::Error(e),
         };
+        if let Err(e) = self.check(&reply) {
+            wipe(&mut reply);
+            return if self.unlocked {
+                Resolved::Error(e)
+            } else {
+                Resolved::Locked
+            };
+        }
         let mut items = match reply["data"]["data"].take() {
             Value::Array(items) => items,
             _ => Vec::new(),
         };
         wipe(&mut reply);
-        items.retain(|i| login_hosts(i).any(|h| h == domain));
-        let found = match items.len() {
-            0 => Resolved::NotFound,
-            1 => items.pop().map_or(Resolved::NotFound, Resolved::Item),
-            n => Resolved::Ambiguous(n),
+        let found = match pick(&items) {
+            Pick::None => Resolved::NotFound,
+            Pick::One(i) => Resolved::Item(items.swap_remove(i)),
+            Pick::Several(n) => Resolved::Ambiguous(n),
         };
         items.iter_mut().for_each(wipe);
         found
@@ -704,6 +729,114 @@ pub fn login_hosts(item: &Value) -> impl Iterator<Item = String> + '_ {
         .filter_map(|u| u["uri"].as_str().and_then(host_of))
 }
 
+/// Bitwarden URI match detection values whose URI is not a plain address:
+/// regular expression (4) and never (5).
+const NOT_A_HOST_MATCH: &[u64] = &[4, 5];
+
+/// Hosts a login may be matched on: its URIs' hosts, except URIs set to
+/// never match or to a regular expression.
+fn matching_hosts(item: &Value) -> impl Iterator<Item = String> + '_ {
+    item["login"]["uris"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|u| {
+            u["match"]
+                .as_u64()
+                .is_none_or(|m| !NOT_A_HOST_MATCH.contains(&m))
+        })
+        .filter_map(|u| u["uri"].as_str().and_then(host_of))
+}
+
+/// Which of a search's results to release.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pick {
+    None,
+    One(usize),
+    Several(usize),
+}
+
+fn pick_where(items: &[Value], f: impl Fn(&Value) -> bool) -> Pick {
+    let mut hits = items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| f(i))
+        .map(|(n, _)| n);
+    match (hits.next(), hits.count()) {
+        (None, _) => Pick::None,
+        (Some(n), 0) => Pick::One(n),
+        (Some(_), more) => Pick::Several(more + 1),
+    }
+}
+
+/// `www.example.com` -> `example.com`.
+fn bare(host: &str) -> &str {
+    host.strip_prefix("www.").unwrap_or(host)
+}
+
+/// The host a lookup names, when it names one: a URL's host, or a bare
+/// dotted name of letters, digits and `-` (`github.com`). Item ids and
+/// names with spaces or other characters are not hosts.
+pub fn host_query(search: &str) -> Option<String> {
+    let s = search.trim();
+    let host = if s.contains("://") {
+        host_of(s)?
+    } else {
+        s.to_ascii_lowercase()
+    };
+    let labels_ok = host
+        .split('.')
+        .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    (host.contains('.') && labels_ok).then_some(host)
+}
+
+/// Choose a login for a host, deterministically, among bw's search results:
+///
+/// 1. Logins with a URI on exactly that host, or named exactly that host
+///    (`www.` is ignored on both sides).
+/// 2. Only if there are none: logins with a URI on a subdomain of it
+///    (`github.com` finds `gist.github.com`).
+///
+/// More than one login in the first tier that has any is ambiguous. Partial
+/// matches of names, URIs or usernames never count, and URIs set to never
+/// match or to a regular expression are skipped.
+pub fn pick_by_host(items: &[Value], host: &str) -> Pick {
+    let q = bare(host);
+    let dot_q = format!(".{q}");
+    let logins = |i: &Value| i["login"].is_object();
+    let exact = pick_where(items, |i| {
+        logins(i)
+            && (matching_hosts(i).any(|h| bare(&h) == q)
+                || i["name"]
+                    .as_str()
+                    .is_some_and(|n| bare(&n.trim().to_ascii_lowercase()) == q))
+    });
+    if exact != Pick::None {
+        return exact;
+    }
+    pick_where(items, |i| {
+        logins(i) && matching_hosts(i).any(|h| h.ends_with(&dot_q))
+    })
+}
+
+/// Choose among several search results the one named exactly `name` (any
+/// case); otherwise every result counts toward the ambiguity.
+pub fn pick_by_name(items: &[Value], name: &str) -> Pick {
+    let name = name.trim();
+    match pick_where(items, |i| {
+        i["name"]
+            .as_str()
+            .is_some_and(|n| n.trim().eq_ignore_ascii_case(name))
+    }) {
+        Pick::None => match items.len() {
+            0 => Pick::None,
+            1 => Pick::One(0),
+            n => Pick::Several(n),
+        },
+        p => p,
+    }
+}
+
 /// Overwrite every string in a JSON value before it is dropped: bw replies
 /// and request templates carry passwords and seeds.
 pub fn wipe(v: &mut Value) {
@@ -767,6 +900,77 @@ mod tests {
         );
         assert_eq!(host_of("example.com").as_deref(), Some("example.com"));
         assert_eq!(host_of("https://"), None);
+    }
+
+    #[test]
+    fn host_queries() {
+        assert_eq!(host_query("GitHub.com").as_deref(), Some("github.com"));
+        assert_eq!(
+            host_query("https://github.com/login").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(host_query("10.0.0.5").as_deref(), Some("10.0.0.5"));
+        assert_eq!(host_query("GitHub"), None);
+        assert_eq!(host_query("My Bank.com"), None);
+        assert_eq!(host_query("a..b"), None);
+        assert_eq!(host_query("github.com."), None);
+        assert_eq!(host_query("2b5c1f4e-0a2d-4b7e-9f3a-1c2d3e4f5a6b"), None);
+    }
+
+    fn login(name: &str, uris: &[(&str, Option<u64>)]) -> Value {
+        let uris: Vec<Value> = uris
+            .iter()
+            .map(|(u, m)| serde_json::json!({ "uri": u, "match": m }))
+            .collect();
+        serde_json::json!({ "type": 1, "name": name, "login": { "uris": uris } })
+    }
+
+    #[test]
+    fn host_picks() {
+        let gh = login("GitHub", &[("https://github.com/login", None)]);
+        let gist = login("Gist", &[("https://gist.github.com", None)]);
+        let named = login("github.com", &[]);
+        let www = login("Amazon", &[("https://www.amazon.com/ap/signin", Some(0))]);
+        let lookalike = login("Evil", &[("https://github.com.evil.io", None)]);
+        let never = login("Old", &[("https://github.com", Some(5))]);
+        let regex = login("Re", &[("^https://github\\.com/.*", Some(4))]);
+        let note = serde_json::json!({ "type": 2, "name": "github.com" });
+
+        let items = [
+            lookalike.clone(),
+            gist.clone(),
+            gh.clone(),
+            never,
+            regex,
+            note,
+        ];
+        // An exact host wins over a subdomain; look-alikes and skipped URIs never count.
+        assert_eq!(pick_by_host(&items, "github.com"), Pick::One(2));
+        assert_eq!(pick_by_host(&items, "www.github.com"), Pick::One(2));
+        assert_eq!(pick_by_host(&items, "gist.github.com"), Pick::One(1));
+        assert_eq!(pick_by_host(&items, "hub.com"), Pick::None);
+        assert_eq!(pick_by_host(&items, "api.github.com"), Pick::None);
+        // Several exact matches, or several subdomains, are ambiguous.
+        assert_eq!(
+            pick_by_host(&[gh.clone(), named.clone()], "github.com"),
+            Pick::Several(2)
+        );
+        assert_eq!(pick_by_host(&[named], "github.com"), Pick::One(0));
+        let api = login("API", &[("https://api.github.com", None)]);
+        assert_eq!(
+            pick_by_host(&[gist.clone(), api], "github.com"),
+            Pick::Several(2)
+        );
+        assert_eq!(pick_by_host(&[gist], "github.com"), Pick::One(0));
+        assert_eq!(pick_by_host(&[www], "amazon.com"), Pick::One(0));
+    }
+
+    #[test]
+    fn name_picks() {
+        let items = [login("GitHub Enterprise", &[]), login("github", &[])];
+        assert_eq!(pick_by_name(&items, "GitHub"), Pick::One(1));
+        assert_eq!(pick_by_name(&items, "Git"), Pick::Several(2));
+        assert_eq!(pick_by_name(&[], "Git"), Pick::None);
     }
 
     #[test]
@@ -1000,6 +1204,12 @@ while True:
         );
         assert_eq!(v.totp_code(&id).await.as_deref(), Some("123456"));
         assert!(matches!(v.resolve("nothing").await, Resolved::NotFound));
+        // Hosts match on URI hosts only, never on part of one.
+        assert!(matches!(
+            v.resolve("https://github.com/settings").await,
+            Resolved::Item(_)
+        ));
+        assert!(matches!(v.resolve("hub.com").await, Resolved::NotFound));
 
         v.lock().await;
         assert!(!v.is_unlocked());

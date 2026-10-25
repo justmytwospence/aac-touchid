@@ -23,6 +23,15 @@ The sheet has no rich text, so the agent and item names use Unicode mathematical
 
 If you touch the sensor, the secret goes to that device and into the command's environment. If you cancel or don't answer within 60 s, the agent gets `aac` exit code 4 ("Request denied").
 
+### Which item is found
+
+A host (`github.com`) or URL (`https://github.com/login`, reduced to its host) is matched on login URI hosts, deterministically:
+
+1. Logins with a URI on exactly that host, or named exactly that host. A leading `www.` is ignored on both sides.
+2. Only if there are none, logins with a URI on a subdomain of it (`github.com` finds `gist.github.com`, but `api.github.com` does not find `github.com`).
+
+If the first tier with any logins has more than one, the request is denied as ambiguous and the agent must ask by item id. Partial matches (`hub.com`, `github.com.evil.io`, a name or username containing the text) never count, and URIs whose match detection is set to Never or Regular expression are skipped. Anything that is not a host (an item id, a name like `GitHub`) goes to `bw`'s own lookup; when that finds several items, one named exactly that (any case) is chosen, otherwise the request is ambiguous.
+
 ## New logins and 2FA
 
 Agents can also create a Bitwarden login for a new service and add 2FA to it. Stock `aac` sends only free text, so both ride in the item part of `--domain`, before the usual `| agent | reason` fields:
