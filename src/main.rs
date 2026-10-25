@@ -6,6 +6,7 @@
 mod bitwarden;
 mod control;
 mod dialog;
+mod intent;
 mod provision;
 mod serve;
 mod storage;
