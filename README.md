@@ -23,6 +23,48 @@ The sheet has no rich text, so the agent and item names use Unicode mathematical
 
 If you touch the sensor, the secret goes to that device and into the command's environment. If you cancel or don't answer within 60 s, the agent gets `aac` exit code 4 ("Request denied").
 
+## New logins and 2FA
+
+Agents can also create a Bitwarden login for a new service and add 2FA to it. Stock `aac` sends only free text, so both ride in the item part of `--domain`, before the usual `| agent | reason` fields:
+
+```sh
+# Create a login with a generated password and receive that password.
+aac run --domain "new:acme.io user=bot@example.com | pi · homelab | sign up for Acme" \
+  --env PASSWORD=password -- ./signup.sh
+
+# Store the 2FA seed from the signup page and receive the current code.
+aac run --domain "totp:acme.io secret=JBSWY3DPEHPK3PXP | pi · homelab | enroll 2FA" \
+  --env CODE=totp -- ./confirm-2fa.sh
+```
+
+| Request | What it does |
+|---|---|
+| `new:<name> [user=<u>] [url=<full url>] [length=12-128] [symbols=no]` | Creates a login named `<name>` with a password from `bw`'s generator (24 characters with symbols by default) and releases username, password, URI and item id. If `<name>` looks like a host (`acme.io`), the URI defaults to `https://<name>`. |
+| `totp:<item> secret=<base32>` | Stores a TOTP seed on a login and releases its username and current code, so the agent can confirm enrollment. |
+| `totp:<item> uri=otpauth://totp/...?secret=...` | The same, from an `otpauth://` URI; its other parameters (digits, period, algorithm) are kept. |
+| anything else | A normal read, unchanged. |
+
+`<name>` may have spaces and the characters `. - _ @ & + '`. `<item>` is one word: a domain, an item name without spaces, or an item id. Secrets are uppercased, `=` and `-` are dropped, and the rest must be base32 (A-Z, 2-7), 16-128 characters. Later reads use the normal flow (`--domain acme.io`).
+
+Each write shows its own Touch ID sheet:
+
+> Bitwarden is trying to create a login and share its password
+>
+> **𝗽𝗶 · 𝗵𝗼𝗺𝗲𝗹𝗮𝗯** (nuc)
+> **𝗮𝗰𝗺𝗲.𝗶𝗼** (bot@example.com)
+> sign up for Acme
+
+> Bitwarden is trying to add 2FA and share a 2FA code
+
+Guardrails:
+
+- `new:` is refused if an item with that name (any case) or a login for that host already exists, checked before the sheet and again after approval.
+- New logins go in the folder `Agent-created` (created on first use), with a note naming the agent, device and reason.
+- `totp:` works only on a login that resolves to exactly one item, sits in `Agent-created`, and has no 2FA seed. An agent can never add 2FA to a login you made, and never overwrites a seed; the item is read again after approval to make sure.
+- `totp:` releases only the username and the current code, never the seed or the password.
+- Malformed requests are refused without a sheet: unknown or repeated options, more than one seed, HOTP (`otpauth://hotp/`), an `otpauth` URI without a secret, a length outside 12-128. Error messages never repeat the request.
+- Repeat denials are remembered per `new <name>` and `2FA <item>`, like reads.
+
 It replaces the interactive `aac listen` terminal app. There is nothing to keep open, and nothing an agent can type, click or send to a terminal pane can approve a request.
 
 ## Requirements
@@ -69,12 +111,13 @@ State (identity key, paired devices) lives in `~/Library/Application Support/aac
 
 Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents, the machines they run on, and the relay.
 
-- Every credential needs a biometric or Watch approval (LocalAuthentication `deviceOwnerAuthenticationWithBiometricsOrCompanion`, password fallback hidden). The sheet names the agent (self-reported) and its device (verified), the vault item, the username and the agent's stated reason.
+- Every credential and every write needs a biometric or Watch approval (LocalAuthentication `deviceOwnerAuthenticationWithBiometricsOrCompanion`, password fallback hidden). The sheet names the agent (self-reported) and its device (verified), the vault item, the username and the agent's stated reason.
 - Only paired devices can ask. Automatic pairing goes only to the machines named in the service's arguments, with a one-time PSK token delivered over the local process or authenticated ssh; the Noise PSK handshake binds it to that listener. Manual pairing needs a code from `aac-touchid pair` and a Touch ID approval. A code an agent obtains alone does not pair anything.
 - After a denial, the same device asking for the same item is denied silently for 60 s, and a cancelled unlock dialog is not shown again for 2 minutes, so an agent cannot spam prompts.
 - The master password and vault key never go into an environment variable or a command line, where any process of the same user can read it (`ps -E`). The listener runs one `bw serve` child on a private socket pair (`--hostname fd+connected://3`, a supported `bw serve` mode) that no other process can open; the master password travels once in its `POST /unlock` body and the vault key stays inside that child. Locking calls `/lock` and stops the child.
 - `bw login --apikey` reads the API key only from its environment, so on first login the key is in that one short-lived child's environment. The API key alone cannot decrypt the vault.
 - Only username, password, URI and the current 2FA code (never the TOTP seed) are released.
+- A `totp:` seed is in the requesting machine's `aac` command line while it runs, where processes of the same user there can read it, and the agent has seen it once on the signup page. It leaves the listener only inside the encrypted vault: logs and `status` show `totp:<item> [redacted]` and `2FA <item>`. Generated passwords and seeds are wiped from the listener's request buffers after use.
 - Agent names are reduced to letters, digits, spaces and `· . - _ / @`, so a name cannot fake a device suffix or extra lines. Pairing completes only within 5 minutes of `aac-touchid pair`, and the sheet names the device and when its code was issued.
 - The relay sees only device fingerprints and timing (Noise protocol, end to end).
 
