@@ -56,6 +56,23 @@ pub enum Generator {
     Password { length: u32, symbols: bool },
 }
 
+impl Generator {
+    /// For the approval sheet: the format, never the password.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Passphrase { words } => format!("{words}-word passphrase"),
+            Self::Password {
+                length,
+                symbols: true,
+            } => format!("{length}-character password"),
+            Self::Password {
+                length,
+                symbols: false,
+            } => format!("{length}-character password without symbols"),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq)]
 pub struct AddTotp {
     /// One word: a domain, an item name without spaces, or an item id.
@@ -493,6 +510,19 @@ mod tests {
         assert_eq!(
             new("new:x words=6").secret,
             Generator::Passphrase { words: 6 }
+        );
+    }
+
+    #[test]
+    fn generator_descriptions() {
+        assert_eq!(new("new:x").secret.describe(), "6-word passphrase");
+        assert_eq!(
+            new("new:x length=32").secret.describe(),
+            "32-character password"
+        );
+        assert_eq!(
+            new("new:x symbols=no").secret.describe(),
+            "24-character password without symbols"
         );
     }
 

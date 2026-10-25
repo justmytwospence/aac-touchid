@@ -227,10 +227,16 @@ pub fn credential_reason(
     sheet(&format!("share a {fields}"), who, item, username, why)
 }
 
-/// `Bitwarden is trying to create a login and share its password`.
-pub fn create_reason(who: &str, name: &str, username: Option<&str>, why: Option<&str>) -> String {
+/// `Bitwarden is trying to create a login with a 6-word passphrase and share it`.
+pub fn create_reason(
+    who: &str,
+    name: &str,
+    username: Option<&str>,
+    secret: &str,
+    why: Option<&str>,
+) -> String {
     sheet(
-        "create a login and share its password",
+        &format!("create a login with a {secret} and share it"),
         who,
         name,
         username,
@@ -642,7 +648,13 @@ impl Service {
         if !self.admit(&p, &what).await || !self.may_create(&p, &what, &n).await {
             return deny(reply);
         }
-        let reason = create_reason(&p.who, &n.name, n.username.as_deref(), p.why.as_deref());
+        let reason = create_reason(
+            &p.who,
+            &n.name,
+            n.username.as_deref(),
+            &n.secret.describe(),
+            p.why.as_deref(),
+        );
         if !self.approve(&p, &what, reason).await || !self.may_create(&p, &what, &n).await {
             return deny(reply);
         }
@@ -1064,16 +1076,22 @@ mod tests {
     fn write_sheet_texts() {
         let who = requester(Some("pi"), "nuc");
         assert_eq!(
-            create_reason(&who, "acme.io", Some("bot@x.com"), Some("sign up")),
+            create_reason(
+                &who,
+                "acme.io",
+                Some("bot@x.com"),
+                "6-word passphrase",
+                Some("sign up")
+            ),
             format!(
-                "create a login and share its password\n\n{who}\n{} (bot@x.com)\nsign up",
+                "create a login with a 6-word passphrase and share it\n\n{who}\n{} (bot@x.com)\nsign up",
                 bold("acme.io")
             )
         );
         assert_eq!(
-            create_reason(&who, "Acme", None, None),
+            create_reason(&who, "Acme", None, "24-character password", None),
             format!(
-                "create a login and share its password\n\n{who}\n{}\nno reason given",
+                "create a login with a 24-character password and share it\n\n{who}\n{}\nno reason given",
                 bold("Acme")
             )
         );

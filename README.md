@@ -46,9 +46,9 @@ aac run --domain "totp:acme.io secret=JBSWY3DPEHPK3PXP | pi · homelab | enroll 
 
 `<name>` may have spaces and the characters `. - _ @ & + '`. `<item>` is one word: a domain, an item name without spaces, or an item id. Secrets are uppercased, `=` and `-` are dropped, and the rest must be base32 (A-Z, 2-7), 16-128 characters. Later reads use the normal flow (`--domain acme.io`).
 
-Each write shows its own Touch ID sheet:
+Each write shows its own Touch ID sheet. A new login's sheet names the password format (`6-word passphrase`, `32-character password`, `24-character password without symbols`), never the password:
 
-> Bitwarden is trying to create a login and share its password
+> Bitwarden is trying to create a login with a 6-word passphrase and share it
 >
 > **𝗽𝗶 · 𝗵𝗼𝗺𝗲𝗹𝗮𝗯** (nuc)
 > **𝗮𝗰𝗺𝗲.𝗶𝗼** (bot@example.com)
