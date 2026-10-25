@@ -4,7 +4,7 @@
 //! the `| agent | reason` fields:
 //!
 //! - `new:<name> [user=<u>] [url=<full url>] [words=3-20]` creates a login
-//!   with a generated passphrase (`Violet-Shrug0-Broken`), or with
+//!   with a generated six-word passphrase (`Violet-Shrug0-Broken-...`), or with
 //!   `[length=12-128] [symbols=no]` a random password.
 //! - `totp:<item> secret=<base32>` or `totp:<item> uri=otpauth://totp/...`
 //!   stores a 2FA seed on a login.
@@ -23,7 +23,7 @@ pub const MAX_LENGTH: u32 = 128;
 pub const DEFAULT_LENGTH: u32 = 24;
 pub const MIN_WORDS: u32 = 3;
 pub const MAX_WORDS: u32 = 20;
-pub const DEFAULT_WORDS: u32 = 3;
+pub const DEFAULT_WORDS: u32 = 6;
 const MAX_NAME: usize = 64;
 const MAX_ITEM: usize = 128;
 const MAX_USER: usize = 128;
