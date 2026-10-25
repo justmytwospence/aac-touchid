@@ -394,8 +394,20 @@ impl Vault {
         found
     }
 
+    /// Find and read the item a request names. Reads do not otherwise sync,
+    /// so a miss syncs once and looks again: an item made elsewhere since the
+    /// last sync (unlock or write) is found instead of denied.
     pub async fn lookup(&mut self, query: &CredentialQuery) -> Lookup {
-        match self.resolve(query.search_string()).await {
+        let search = query.search_string();
+        let mut found = self.resolve(search).await;
+        if matches!(found, Resolved::NotFound) {
+            match self.sync().await {
+                Ok(()) => found = self.resolve(search).await,
+                Err(_) if !self.unlocked => return Lookup::Locked,
+                Err(e) => tracing::warn!("sync after a miss failed: {e}"),
+            }
+        }
+        match found {
             Resolved::Item(v) => match serde_json::from_value::<BwItem>(v) {
                 Ok(item) => self.credential_from(item).await,
                 Err(e) => Lookup::Error(format!("parse item: {e}")),
@@ -1029,6 +1041,8 @@ mod tests {
             concat!("#!/usr/bin/env python3\n", r#"import os, socket, json, sys, urllib.parse
 s = socket.socket(fileno=3)
 folders = []
+syncs = 0
+later = {"i9": {"id": "i9", "type": 1, "folderId": None, "name": "ElevenLabs", "notes": None, "login": {"username": "el", "password": "pw", "totp": None, "uris": [{"uri": "elevenlabs.io"}]}}}
 items = {"i1": {"id": "i1", "type": 1, "folderId": None, "name": "GitHub", "notes": "RECOVERY", "login": {"username": "me", "password": "pw", "totp": "SEED", "uris": [{"uri": "https://github.com/login"}]}}}
 leak = any("hunter2" in v for v in os.environ.values()) or any("hunter2" in a for a in sys.argv)
 f = s.makefile("rb")
@@ -1050,7 +1064,13 @@ while True:
     def hit(i, term):
         term = urllib.parse.unquote(term).lower()
         return term in i["name"].lower() or any(term in u["uri"] for u in i["login"]["uris"])
-    if route == "/unlock":
+    if route == "/sync":
+        # The first sync (at unlock) predates the item made elsewhere.
+        syncs += 1
+        if syncs > 1:
+            items.update(later)
+        out = {"success": True}
+    elif route == "/unlock":
         ok = json.loads(body)["password"] == "hunter2" and not leak
         out = {"success": True, "data": {"raw": "SESSIONKEY"}} if ok else {"success": False, "message": "Invalid master password."}
     elif route == "/generate":
@@ -1072,7 +1092,7 @@ while True:
         out = {"success": True, "data": {"object": "list", "data": [i for i in items.values() if hit(i, q["search"])]}}
     elif route == "/object/item" and method == "POST":
         item = json.loads(body)
-        item["id"] = "n%d" % len(items)
+        item["id"] = "n%d" % len([k for k in items if k not in later])
         items[item["id"]] = item
         out = {"success": True, "data": item}
     elif route.startswith("/object/item/") and method == "PUT":
@@ -1126,6 +1146,23 @@ while True:
             }
             other => panic!("unexpected {other:?}"),
         }
+
+        // An item made after the unlock's sync: the miss syncs and finds it.
+        match v
+            .lookup(&CredentialQuery::Domain("elevenlabs.io".into()))
+            .await
+        {
+            Lookup::Found(c, name, _) => {
+                assert_eq!(name.as_deref(), Some("ElevenLabs"));
+                assert_eq!(c.username.as_deref(), Some("el"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            v.lookup(&CredentialQuery::Domain("nowhere.example".into()))
+                .await,
+            Lookup::NotFound
+        ));
 
         assert_eq!(v.sync().await, Ok(()));
         // Writes: generator, agent folder, new login, 2FA seed.
