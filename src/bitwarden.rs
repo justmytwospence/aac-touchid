@@ -774,16 +774,13 @@ fn bare(host: &str) -> &str {
     host.strip_prefix("www.").unwrap_or(host)
 }
 
-/// The host a lookup names, when it names one: a URL's host, or a bare
+/// The host a lookup names, when it names one: a URL's host (scheme,
+/// user, port, path, query and fragment dropped) or a bare
 /// dotted name of letters, digits and `-` (`github.com`). Item ids and
 /// names with spaces or other characters are not hosts.
 pub fn host_query(search: &str) -> Option<String> {
     let s = search.trim();
-    let host = if s.contains("://") {
-        host_of(s)?
-    } else {
-        s.to_ascii_lowercase()
-    };
+    let host = host_of(s)?;
     let labels_ok = host
         .split('.')
         .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
@@ -910,6 +907,11 @@ mod tests {
             Some("github.com")
         );
         assert_eq!(host_query("10.0.0.5").as_deref(), Some("10.0.0.5"));
+        assert_eq!(
+            host_query("GitHub.com/login?next=/x").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(host_query("github.com:443").as_deref(), Some("github.com"));
         assert_eq!(host_query("GitHub"), None);
         assert_eq!(host_query("My Bank.com"), None);
         assert_eq!(host_query("a..b"), None);

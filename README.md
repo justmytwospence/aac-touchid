@@ -25,7 +25,7 @@ If you touch the sensor, the secret goes to that device and into the command's e
 
 ### Which item is found
 
-A host (`github.com`) or URL (`https://github.com/login`, reduced to its host) is matched on login URI hosts, deterministically:
+A host (`github.com`) or URL (`https://github.com/login` or `github.com/login`, reduced to its host) is matched on login URI hosts, deterministically:
 
 1. Logins with a URI on exactly that host, or named exactly that host. A leading `www.` is ignored on both sides.
 2. Only if there are none, logins with a URI on a subdomain of it (`github.com` finds `gist.github.com`, but `api.github.com` does not find `github.com`).
