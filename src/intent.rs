@@ -3,8 +3,9 @@
 //! Stock `aac` 0.11 sends only free text, so two writes ride in it, before
 //! the `| agent | reason` fields:
 //!
-//! - `new:<name> [user=<u>] [url=<full url>] [length=12-128] [symbols=no]`
-//!   creates a login with a generated password.
+//! - `new:<name> [user=<u>] [url=<full url>] [words=3-20]` creates a login
+//!   with a generated passphrase (`Violet-Shrug0-Broken`), or with
+//!   `[length=12-128] [symbols=no]` a random password.
 //! - `totp:<item> secret=<base32>` or `totp:<item> uri=otpauth://totp/...`
 //!   stores a 2FA seed on a login.
 //!
@@ -20,6 +21,9 @@ use crate::bitwarden::host_of;
 pub const MIN_LENGTH: u32 = 12;
 pub const MAX_LENGTH: u32 = 128;
 pub const DEFAULT_LENGTH: u32 = 24;
+pub const MIN_WORDS: u32 = 3;
+pub const MAX_WORDS: u32 = 20;
+pub const DEFAULT_WORDS: u32 = 3;
 const MAX_NAME: usize = 64;
 const MAX_ITEM: usize = 128;
 const MAX_USER: usize = 128;
@@ -40,8 +44,16 @@ pub struct NewLogin {
     pub name: String,
     pub username: Option<String>,
     pub uri: Option<String>,
-    pub length: u32,
-    pub symbols: bool,
+    pub secret: Generator,
+}
+
+/// How the new login's password is generated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Generator {
+    /// Capitalized words joined by `-`, one with a digit: `Violet-Shrug0-Broken`.
+    Passphrase { words: u32 },
+    /// Upper, lower, digits, and symbols unless turned off.
+    Password { length: u32, symbols: bool },
 }
 
 #[derive(PartialEq, Eq)]
@@ -75,6 +87,8 @@ pub enum ParseError {
     BadUrl,
     BadLength,
     BadSymbols,
+    BadWords,
+    MixedGenerators,
     MissingSeed,
     DuplicateSeed,
     BadSecret,
@@ -97,6 +111,8 @@ impl fmt::Display for ParseError {
             Self::BadUrl => "url must be a full http(s) URL",
             Self::BadLength => "length must be 12-128",
             Self::BadSymbols => "symbols must be yes or no",
+            Self::BadWords => "words must be 3-20",
+            Self::MixedGenerators => "words= cannot be combined with length= or symbols=",
             Self::MissingSeed => "totp: needs secret= or uri=",
             Self::DuplicateSeed => "more than one seed given",
             Self::BadSecret => "secret must be base32 (A-Z, 2-7), 16-128 characters",
@@ -187,6 +203,7 @@ fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
     let mut url = None;
     let mut length = None;
     let mut symbols = None;
+    let mut words = None;
     for (key, value) in options {
         let slot_taken = match key.to_ascii_lowercase().as_str() {
             "user" => {
@@ -216,6 +233,13 @@ fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
                 }
                 length.replace(n).is_some()
             }
+            "words" => {
+                let n: u32 = value.parse().map_err(|_| ParseError::BadWords)?;
+                if !(MIN_WORDS..=MAX_WORDS).contains(&n) {
+                    return Err(ParseError::BadWords);
+                }
+                words.replace(n).is_some()
+            }
             "symbols" => {
                 let on = match value.to_ascii_lowercase().as_str() {
                     "yes" => true,
@@ -237,8 +261,19 @@ fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
         name,
         username,
         uri,
-        length: length.unwrap_or(DEFAULT_LENGTH),
-        symbols: symbols.unwrap_or(true),
+        secret: match (words, length, symbols) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                return Err(ParseError::MixedGenerators);
+            }
+            (None, None, None) => Generator::Passphrase {
+                words: DEFAULT_WORDS,
+            },
+            (Some(words), _, _) => Generator::Passphrase { words },
+            (None, length, symbols) => Generator::Password {
+                length: length.unwrap_or(DEFAULT_LENGTH),
+                symbols: symbols.unwrap_or(true),
+            },
+        },
     })
 }
 
@@ -401,8 +436,9 @@ mod tests {
                 name: "Acme".into(),
                 username: None,
                 uri: None,
-                length: DEFAULT_LENGTH,
-                symbols: true,
+                secret: Generator::Passphrase {
+                    words: DEFAULT_WORDS
+                },
             }
         );
         assert_eq!(
@@ -427,8 +463,10 @@ mod tests {
                 name: "Acme".into(),
                 username: Some("me@x.com".into()),
                 uri: Some("https://acme.io/login".into()),
-                length: 32,
-                symbols: false,
+                secret: Generator::Password {
+                    length: 32,
+                    symbols: false
+                },
             }
         );
         assert_eq!(
@@ -438,9 +476,24 @@ mod tests {
             Some("https://login.example.com"),
             "url wins over the name"
         );
-        assert_eq!(new("new:x length=12").length, 12);
-        assert_eq!(new("new:x length=128").length, 128);
-        assert!(new("new:x symbols=yes").symbols);
+        assert_eq!(
+            new("new:x length=12").secret,
+            Generator::Password {
+                length: 12,
+                symbols: true
+            }
+        );
+        assert_eq!(
+            new("new:x symbols=no").secret,
+            Generator::Password {
+                length: DEFAULT_LENGTH,
+                symbols: false
+            }
+        );
+        assert_eq!(
+            new("new:x words=6").secret,
+            Generator::Passphrase { words: 6 }
+        );
     }
 
     #[test]
@@ -455,6 +508,10 @@ mod tests {
             ("new:x length=129", BadLength),
             ("new:x length=abc", BadLength),
             ("new:x symbols=maybe", BadSymbols),
+            ("new:x words=2", BadWords),
+            ("new:x words=21", BadWords),
+            ("new:x words=5 length=20", MixedGenerators),
+            ("new:x symbols=no words=5", MixedGenerators),
             ("new:x url=ftp://x.com", BadUrl),
             ("new:x url=x.com", BadUrl),
             ("new:x url=https://", BadUrl),

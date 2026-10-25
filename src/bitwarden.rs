@@ -23,6 +23,8 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::intent::Generator;
+
 const BW_FALLBACK_PATHS: &[&str] = &["/opt/homebrew/bin/bw", "/usr/local/bin/bw"];
 const CHILD_FD: i32 = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -372,19 +374,18 @@ impl Vault {
         }
     }
 
-    /// A password from bw's generator: upper, lower, digits, and symbols
-    /// unless turned off. bw reads any present boolean option as true, so
-    /// `special` is left out rather than set to false.
-    pub async fn generate(
-        &mut self,
-        length: u32,
-        symbols: bool,
-    ) -> Result<Zeroizing<String>, String> {
-        let mut path =
-            format!("/generate?length={length}&uppercase=true&lowercase=true&number=true");
-        if symbols {
-            path.push_str("&special=true");
-        }
+    /// A password from bw's generator. Older bw reads any present boolean
+    /// option as true, so options that are off are left out, never false.
+    pub async fn generate(&mut self, how: Generator) -> Result<Zeroizing<String>, String> {
+        let path = match how {
+            Generator::Passphrase { words } => format!(
+                "/generate?passphrase=true&words={words}&separator=-&capitalize=true&includeNumber=true"
+            ),
+            Generator::Password { length, symbols } => format!(
+                "/generate?length={length}&uppercase=true&lowercase=true&number=true{}",
+                if symbols { "&special=true" } else { "" }
+            ),
+        };
         let mut reply = self.call("GET", &path, None).await?;
         self.check(&reply)?;
         let password = match reply["data"]["data"].take() {
@@ -392,7 +393,11 @@ impl Vault {
             _ => return Err("bw generate returned no password".to_string()),
         };
         // Organization policies may lengthen it, never shorten it.
-        if password.chars().count() < length as usize {
+        let short = match how {
+            Generator::Passphrase { words } => password.split('-').count() < words as usize,
+            Generator::Password { length, .. } => password.chars().count() < length as usize,
+        };
+        if short {
             return Err("bw generated a shorter password than asked".to_string());
         }
         Ok(password)
@@ -838,7 +843,11 @@ while True:
         if q.get("special") != "true" and "special" in q:
             out = {"success": False, "message": "special must be left out, not false"}
         else:
-            pw = "A" * int(q["length"]) + ("!" if "special" in q else "")
+            if "passphrase" in q:
+                ok = q == {"passphrase": "true", "words": q["words"], "separator": "-", "capitalize": "true", "includeNumber": "true"}
+                pw = "-".join(["Word"] * int(q["words"])) if ok else "bad"
+            else:
+                pw = "A" * int(q["length"]) + ("!" if "special" in q else "")
             out = {"success": True, "data": {"object": "string", "data": pw}}
     elif route == "/list/object/folders":
         out = {"success": True, "data": {"object": "list", "data": folders}}
@@ -905,9 +914,31 @@ while True:
         }
 
         // Writes: generator, agent folder, new login, 2FA seed.
-        let pw = v.generate(20, false).await.expect("generate");
+        let pw = v
+            .generate(Generator::Password {
+                length: 20,
+                symbols: false,
+            })
+            .await
+            .expect("generate");
         assert_eq!(pw.as_str(), "A".repeat(20));
-        assert!(v.generate(16, true).await.expect("generate").ends_with('!'));
+        let with_symbols = Generator::Password {
+            length: 16,
+            symbols: true,
+        };
+        assert!(
+            v.generate(with_symbols)
+                .await
+                .expect("generate")
+                .ends_with('!')
+        );
+        assert_eq!(
+            v.generate(Generator::Passphrase { words: 3 })
+                .await
+                .expect("passphrase")
+                .as_str(),
+            "Word-Word-Word"
+        );
         assert_eq!(v.agent_folder(false).await, Ok(None));
         assert_eq!(v.agent_folder(true).await, Ok(Some("f1".to_string())));
         assert_eq!(v.agent_folder(false).await, Ok(Some("f1".to_string())));

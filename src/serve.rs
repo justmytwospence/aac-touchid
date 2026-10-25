@@ -647,7 +647,7 @@ impl Service {
             return deny(reply);
         }
         let written = async {
-            let password = self.vault.generate(n.length, n.symbols).await?;
+            let password = self.vault.generate(n.secret).await?;
             let folder = self
                 .vault
                 .agent_folder(true)
