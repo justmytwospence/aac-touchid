@@ -154,8 +154,10 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
         .map(|_| &s[prefix.len()..])
 }
 
+type Options<'a> = Vec<(&'a str, &'a str)>;
+
 /// Leading words without `=`, then `key=value` options.
-fn split_words(rest: &str) -> Result<(Vec<&str>, Vec<(&str, &str)>), ParseError> {
+fn split_words(rest: &str) -> Result<(Vec<&str>, Options<'_>), ParseError> {
     let mut words = Vec::new();
     let mut options = Vec::new();
     for token in rest.split_whitespace() {

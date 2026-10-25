@@ -6,17 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ap_client::{
-    AuditEvent, AuditLog, CredentialQuery, CredentialRequestReply, DefaultProxyClient,
-    FingerprintVerificationReply, IdentityFingerprint, UserClient, UserClientHandle,
-    UserClientNotification, UserClientRequest,
+    AuditEvent, AuditLog, CredentialData, CredentialQuery, CredentialRequestReply,
+    DefaultProxyClient, FingerprintVerificationReply, IdentityFingerprint, UserClient,
+    UserClientHandle, UserClientNotification, UserClientRequest,
 };
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::bitwarden::{Lookup, Vault};
+use crate::bitwarden::{self, Lookup, Resolved, TotpWrite, Vault, host_of, wipe};
 use crate::control::{self, Decision, Envelope, Request, Response, Status};
 use crate::dialog;
+use crate::intent::{self, AddTotp, Intent, NewLogin};
 use crate::storage::{FileConnections, FileIdentity, short_hex};
 use crate::touchid::{self, Outcome};
 
@@ -71,6 +72,15 @@ enum LoopCmd {
 
 struct Audit;
 
+/// A query as the audit log prints it, with any 2FA seed removed.
+fn audit_query(q: &CredentialQuery) -> String {
+    match q {
+        CredentialQuery::Domain(d) => format!("domain: {}", intent::redact(d)),
+        CredentialQuery::Id(id) => format!("id: {}", intent::redact(id)),
+        CredentialQuery::Search(s) => format!("search: {}", intent::redact(s)),
+    }
+}
+
 #[async_trait]
 impl AuditLog for Audit {
     async fn write(&self, event: AuditEvent<'_>) {
@@ -92,7 +102,11 @@ impl AuditLog for Audit {
                 remote_identity,
                 ..
             } => {
-                info!("audit: request {query} from {}", short_hex(remote_identity))
+                info!(
+                    "audit: request {} from {}",
+                    audit_query(query),
+                    short_hex(remote_identity)
+                )
             }
             AuditEvent::CredentialApproved {
                 query,
@@ -100,7 +114,8 @@ impl AuditLog for Audit {
                 fields,
                 ..
             } => info!(
-                "audit: released {query} to {} (username={} password={} totp={})",
+                "audit: released {} to {} (username={} password={} totp={})",
+                audit_query(query),
                 short_hex(remote_identity),
                 fields.has_username,
                 fields.has_password,
@@ -111,7 +126,11 @@ impl AuditLog for Audit {
                 remote_identity,
                 ..
             } => {
-                info!("audit: denied {query} to {}", short_hex(remote_identity))
+                info!(
+                    "audit: denied {} to {}",
+                    audit_query(query),
+                    short_hex(remote_identity)
+                )
             }
             _ => {}
         }
@@ -205,12 +224,32 @@ pub fn credential_reason(
     fields: &str,
     why: Option<&str>,
 ) -> String {
+    sheet(&format!("share a {fields}"), who, item, username, why)
+}
+
+/// `Bitwarden is trying to create a login and share its password`.
+pub fn create_reason(who: &str, name: &str, username: Option<&str>, why: Option<&str>) -> String {
+    sheet(
+        "create a login and share its password",
+        who,
+        name,
+        username,
+        why,
+    )
+}
+
+/// `Bitwarden is trying to add 2FA and share a 2FA code`.
+pub fn totp_reason(who: &str, item: &str, username: Option<&str>, why: Option<&str>) -> String {
+    sheet("add 2FA and share a 2FA code", who, item, username, why)
+}
+
+fn sheet(action: &str, who: &str, item: &str, username: Option<&str>, why: Option<&str>) -> String {
     let user = match username {
         Some(u) if !u.is_empty() => format!(" ({u})"),
         _ => String::new(),
     };
     format!(
-        "share a {fields}\n\n{who}\n{}{user}\n{}",
+        "{action}\n\n{who}\n{}{user}\n{}",
         bold(item),
         why.unwrap_or("no reason given")
     )
@@ -245,6 +284,45 @@ impl Quiet {
     }
     pub fn note_denied(&mut self, who: IdentityFingerprint, what: &str) {
         self.denied.insert((who, what.to_string()), Instant::now());
+    }
+}
+
+type ReplyTx = tokio::sync::oneshot::Sender<CredentialRequestReply>;
+
+fn deny(reply: ReplyTx) {
+    let _ = reply.send(CredentialRequestReply {
+        approved: false,
+        credential: None,
+        credential_id: None,
+    });
+}
+
+fn release(reply: ReplyTx, credential: CredentialData) {
+    let credential_id = credential.credential_id.clone();
+    let _ = reply.send(CredentialRequestReply {
+        approved: true,
+        credential: Some(credential),
+        credential_id,
+    });
+}
+
+/// A credential request from a paired device, after its `| agent | reason`
+/// fields are split off.
+struct Pending {
+    identity: IdentityFingerprint,
+    device: String,
+    /// Who the sheet names: agent (device), or the device.
+    who: String,
+    agent: Option<String>,
+    why: Option<String>,
+}
+
+impl Pending {
+    /// Who a release is recorded for.
+    fn recipient(&self) -> String {
+        self.agent
+            .as_ref()
+            .map_or(self.device.clone(), |a| format!("{a} ({})", self.device))
     }
 }
 
@@ -428,89 +506,288 @@ impl Service {
                 if ask.what == crate::provision::MARKER {
                     // The pairing check aac-touchid itself sends; nothing to release.
                     self.record(&device, "pairing", "paired");
-                    let _ = reply.send(CredentialRequestReply {
-                        approved: false,
-                        credential: None,
-                        credential_id: None,
-                    });
-                    return;
-                }
-                let who = requester(ask.agent.as_deref(), &device);
-                let what = query_label(&query);
-                let deny = |reply: tokio::sync::oneshot::Sender<CredentialRequestReply>| {
-                    let _ = reply.send(CredentialRequestReply {
-                        approved: false,
-                        credential: None,
-                        credential_id: None,
-                    });
-                };
-                if self.quiet.is_quiet(&identity, &what) {
-                    self.record(&device, &what, "denied (repeat within 60 s)");
                     return deny(reply);
                 }
-                if !self.ensure_unlocked(&who, &what, ask.why.as_deref()).await {
-                    self.record(&device, &what, "denied (vault locked)");
-                    self.quiet.note_denied(identity, &what);
-                    return deny(reply);
-                }
-                let (credential, item_name, fields) = match self.vault.lookup(&query).await {
-                    Lookup::Found(c, name, fields) => (c, name, fields),
-                    Lookup::Locked => {
-                        self.lock("bw reported the vault locked").await;
-                        self.record(&device, &what, "denied (vault locked)");
-                        return deny(reply);
-                    }
-                    Lookup::NotFound => {
-                        self.record(&device, &what, "not found");
-                        return deny(reply);
-                    }
-                    Lookup::Ambiguous(n) => {
+                let intent = match intent::parse(&ask.what) {
+                    Ok(i) => i,
+                    Err(e) => {
                         self.record(
                             &device,
-                            &what,
-                            &format!("ambiguous ({n} logins match; request by item id)"),
+                            &intent::redact(&ask.what),
+                            &format!("refused: {e}"),
                         );
                         return deny(reply);
                     }
-                    Lookup::Error(e) => {
-                        warn!("lookup error: {e}");
-                        self.record(&device, &what, "error");
-                        return deny(reply);
-                    }
                 };
-                let domain = credential
-                    .domain
-                    .clone()
-                    .unwrap_or_else(|| query.search_string().to_string());
-                let item = item_name.unwrap_or(domain);
-                let reason = credential_reason(
-                    &who,
-                    &item,
-                    credential.username.as_deref(),
-                    fields.describe(),
-                    ask.why.as_deref(),
-                );
-                let outcome = touchid::confirm(reason, self.cfg.approval_timeout).await;
-                self.last_activity = Instant::now();
-                if outcome == Outcome::Approved {
-                    self.record(
-                        &ask.agent
-                            .clone()
-                            .map_or(device.clone(), |a| format!("{a} ({device})")),
-                        &what,
-                        "approved",
-                    );
-                    let credential_id = credential.credential_id.clone();
-                    let _ = reply.send(CredentialRequestReply {
-                        approved: true,
-                        credential: Some(*credential),
-                        credential_id,
-                    });
-                } else {
-                    self.record(&device, &what, &format!("{outcome:?}").to_lowercase());
-                    self.quiet.note_denied(identity, &what);
-                    deny(reply);
+                let p = Pending {
+                    identity,
+                    who: requester(ask.agent.as_deref(), &device),
+                    device,
+                    agent: ask.agent,
+                    why: ask.why,
+                };
+                match intent {
+                    Intent::Read => self.read(p, query, reply).await,
+                    Intent::Create(n) => self.create(p, n, reply).await,
+                    Intent::AddTotp(t) => self.add_totp(p, t, reply).await,
                 }
+            }
+        }
+    }
+
+    /// Repeat and lock checks before any lookup. Unlocks the vault if needed.
+    async fn admit(&mut self, p: &Pending, what: &str) -> bool {
+        if self.quiet.is_quiet(&p.identity, what) {
+            self.record(&p.device, what, "denied (repeat within 60 s)");
+            return false;
+        }
+        if !self.ensure_unlocked(&p.who, what, p.why.as_deref()).await {
+            self.record(&p.device, what, "denied (vault locked)");
+            self.quiet.note_denied(p.identity, what);
+            return false;
+        }
+        true
+    }
+
+    /// Show the Touch ID sheet. A refusal is recorded and remembered.
+    async fn approve(&mut self, p: &Pending, what: &str, reason: String) -> bool {
+        let outcome = touchid::confirm(reason, self.cfg.approval_timeout).await;
+        self.last_activity = Instant::now();
+        if outcome == Outcome::Approved {
+            return true;
+        }
+        self.record(&p.device, what, &format!("{outcome:?}").to_lowercase());
+        self.quiet.note_denied(p.identity, what);
+        false
+    }
+
+    async fn vault_error(&mut self, p: &Pending, what: &str, e: &str) {
+        if self.vault.is_unlocked() {
+            warn!("vault error: {e}");
+            self.record(&p.device, what, "error");
+        } else {
+            self.lock("bw reported the vault locked").await;
+            self.record(&p.device, what, "denied (vault locked)");
+        }
+    }
+
+    async fn read(&mut self, p: Pending, query: CredentialQuery, reply: ReplyTx) {
+        let what = query_label(&query);
+        if !self.admit(&p, &what).await {
+            return deny(reply);
+        }
+        let (credential, item_name, fields) = match self.vault.lookup(&query).await {
+            Lookup::Found(c, name, fields) => (c, name, fields),
+            Lookup::Locked => {
+                self.lock("bw reported the vault locked").await;
+                self.record(&p.device, &what, "denied (vault locked)");
+                return deny(reply);
+            }
+            Lookup::NotFound => {
+                self.record(&p.device, &what, "not found");
+                return deny(reply);
+            }
+            Lookup::Ambiguous(n) => {
+                self.record(
+                    &p.device,
+                    &what,
+                    &format!("ambiguous ({n} logins match; request by item id)"),
+                );
+                return deny(reply);
+            }
+            Lookup::Error(e) => {
+                warn!("lookup error: {e}");
+                self.record(&p.device, &what, "error");
+                return deny(reply);
+            }
+        };
+        let domain = credential
+            .domain
+            .clone()
+            .unwrap_or_else(|| query.search_string().to_string());
+        let item = item_name.unwrap_or(domain);
+        let reason = credential_reason(
+            &p.who,
+            &item,
+            credential.username.as_deref(),
+            fields.describe(),
+            p.why.as_deref(),
+        );
+        if !self.approve(&p, &what, reason).await {
+            return deny(reply);
+        }
+        self.record(&p.recipient(), &what, "approved");
+        release(reply, *credential);
+    }
+
+    /// Whether `new:` may go ahead: nothing by that name or host exists yet.
+    /// Records why not.
+    async fn may_create(&mut self, p: &Pending, what: &str, n: &NewLogin) -> bool {
+        let host = n.uri.as_deref().and_then(host_of);
+        match self.vault.exists(&n.name, host.as_deref()).await {
+            Ok(false) => true,
+            Ok(true) => {
+                self.record(&p.device, what, "refused (already exists)");
+                false
+            }
+            Err(e) => {
+                self.vault_error(p, what, &e).await;
+                false
+            }
+        }
+    }
+
+    async fn create(&mut self, p: Pending, n: NewLogin, reply: ReplyTx) {
+        let what = format!("new {}", n.name);
+        if !self.admit(&p, &what).await || !self.may_create(&p, &what, &n).await {
+            return deny(reply);
+        }
+        let reason = create_reason(&p.who, &n.name, n.username.as_deref(), p.why.as_deref());
+        if !self.approve(&p, &what, reason).await || !self.may_create(&p, &what, &n).await {
+            return deny(reply);
+        }
+        let written = async {
+            let password = self.vault.generate(n.length, n.symbols).await?;
+            let folder = self
+                .vault
+                .agent_folder(true)
+                .await?
+                .ok_or("no Agent-created folder")?;
+            let notes = format!(
+                "Created by aac-touchid for {} on {}: {}",
+                p.agent.as_deref().unwrap_or("an agent"),
+                p.device,
+                p.why.as_deref().unwrap_or("no reason given")
+            );
+            let id = self
+                .vault
+                .create_login(&bitwarden::NewLogin {
+                    name: &n.name,
+                    username: n.username.as_deref(),
+                    password: &password,
+                    uri: n.uri.as_deref(),
+                    folder_id: &folder,
+                    notes: &notes,
+                })
+                .await?;
+            Ok::<_, String>((id, password))
+        }
+        .await;
+        match written {
+            Ok((id, password)) => {
+                self.record(&p.recipient(), &what, "created");
+                release(
+                    reply,
+                    CredentialData {
+                        username: n.username,
+                        password: Some(password),
+                        totp: None,
+                        uri: n.uri,
+                        notes: None,
+                        credential_id: Some(id),
+                        domain: None,
+                    },
+                );
+            }
+            Err(e) => {
+                self.vault_error(&p, &what, &e).await;
+                deny(reply);
+            }
+        }
+    }
+
+    async fn add_totp(&mut self, p: Pending, t: AddTotp, reply: ReplyTx) {
+        let what = format!("2FA {}", t.item);
+        if !self.admit(&p, &what).await {
+            return deny(reply);
+        }
+        let mut item = match self.vault.resolve(&t.item).await {
+            Resolved::Item(v) => v,
+            Resolved::Locked => {
+                self.lock("bw reported the vault locked").await;
+                self.record(&p.device, &what, "denied (vault locked)");
+                return deny(reply);
+            }
+            Resolved::NotFound => {
+                self.record(&p.device, &what, "not found");
+                return deny(reply);
+            }
+            Resolved::Ambiguous(n) => {
+                self.record(
+                    &p.device,
+                    &what,
+                    &format!("ambiguous ({n} logins match; request by item id)"),
+                );
+                return deny(reply);
+            }
+            Resolved::Error(e) => {
+                self.vault_error(&p, &what, &e).await;
+                return deny(reply);
+            }
+        };
+        let id = item["id"].as_str().map(String::from);
+        let name = item["name"].as_str().map(String::from);
+        let username = item["login"]["username"].as_str().map(String::from);
+        let is_login = item["type"].as_i64() == Some(1) && item["login"].is_object();
+        let has_totp = item["login"]["totp"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty());
+        let in_folder = self.vault.in_agent_folder(&item).await;
+        wipe(&mut item);
+        let refusal = match (&id, in_folder) {
+            _ if !is_login => Some("refused (not a login)"),
+            (None, _) => Some("refused (item has no id)"),
+            (_, Err(e)) => {
+                self.vault_error(&p, &what, &e).await;
+                return deny(reply);
+            }
+            (_, Ok(false)) => Some("refused (not in the Agent-created folder)"),
+            _ if has_totp => Some("refused (already has 2FA)"),
+            _ => None,
+        };
+        let (Some(id), None) = (id, refusal) else {
+            self.record(&p.device, &what, refusal.unwrap_or("refused"));
+            return deny(reply);
+        };
+        let shown = name.unwrap_or_else(|| t.item.clone());
+        let reason = totp_reason(&p.who, &shown, username.as_deref(), p.why.as_deref());
+        if !self.approve(&p, &what, reason).await {
+            return deny(reply);
+        }
+        match self.vault.set_totp(&id, &t.seed).await {
+            Ok(TotpWrite::Stored) => {
+                let code = self.vault.totp_code(&id).await;
+                let outcome = if code.is_some() {
+                    "2FA added"
+                } else {
+                    "2FA added (no code)"
+                };
+                self.record(&p.recipient(), &what, outcome);
+                // The username and current code only: never the seed or the password.
+                release(
+                    reply,
+                    CredentialData {
+                        username,
+                        password: None,
+                        totp: code,
+                        uri: None,
+                        notes: None,
+                        credential_id: Some(id),
+                        domain: None,
+                    },
+                );
+            }
+            Ok(TotpWrite::AlreadySet) => {
+                self.record(&p.device, &what, "refused (already has 2FA)");
+                deny(reply);
+            }
+            Ok(TotpWrite::NotLogin) => {
+                self.record(&p.device, &what, "refused (not a login)");
+                deny(reply);
+            }
+            Err(e) => {
+                self.vault_error(&p, &what, &e).await;
+                deny(reply);
             }
         }
     }
@@ -780,6 +1057,60 @@ mod tests {
                 "pair a new device\n\n{}\nfrom the pairing code issued 1 min ago",
                 bold("nuc")
             )
+        );
+    }
+
+    #[test]
+    fn write_sheet_texts() {
+        let who = requester(Some("pi"), "nuc");
+        assert_eq!(
+            create_reason(&who, "acme.io", Some("bot@x.com"), Some("sign up")),
+            format!(
+                "create a login and share its password\n\n{who}\n{} (bot@x.com)\nsign up",
+                bold("acme.io")
+            )
+        );
+        assert_eq!(
+            create_reason(&who, "Acme", None, None),
+            format!(
+                "create a login and share its password\n\n{who}\n{}\nno reason given",
+                bold("Acme")
+            )
+        );
+        assert_eq!(
+            totp_reason(&who, "Acme", Some("bot"), Some("enroll 2FA")),
+            format!(
+                "add 2FA and share a 2FA code\n\n{who}\n{} (bot)\nenroll 2FA",
+                bold("Acme")
+            )
+        );
+    }
+
+    #[test]
+    fn audit_and_labels_never_show_a_seed() {
+        let seed = "JBSWY3DPEHPK3PXP";
+        for raw in [
+            format!("totp:acme.io secret={seed} | pi | enroll"),
+            format!("totp:acme.io uri=otpauth://totp/a?secret={seed}"),
+            format!("totp:acme.io secret={seed} {seed}"),
+        ] {
+            for q in [
+                CredentialQuery::Domain(raw.clone()),
+                CredentialQuery::Id(raw.clone()),
+                CredentialQuery::Search(raw.clone()),
+            ] {
+                assert!(!audit_query(&q).contains(seed), "{raw}");
+            }
+            let ask = parse_ask(&raw);
+            let label = match intent::parse(&ask.what) {
+                Ok(Intent::AddTotp(t)) => format!("2FA {}", t.item),
+                _ => intent::redact(&ask.what),
+            };
+            assert!(!label.contains(seed), "{label}");
+        }
+        assert_eq!(
+            audit_query(&CredentialQuery::Domain("github.com | pi | x".into())),
+            "domain: github.com | pi | x"
         );
     }
 
