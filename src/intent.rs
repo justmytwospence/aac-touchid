@@ -9,10 +9,15 @@
 //! - `totp:<item> secret=<base32>` or `totp:<item> uri=otpauth://totp/...`
 //!   stores a 2FA seed on a login.
 //!
+//! - `<item> remember=15m` is a read that also asks to release the same item
+//!   again for that long (1m-24h) without another sheet.
+//! - `batch:<a>,<b>,... [remember=15m]` approves several items on one sheet.
+//!
 //! Anything else is a read. Parsing is pure. Errors are fixed strings that
 //! never echo the request, which may hold a seed.
 
 use std::fmt;
+use std::time::Duration;
 
 use zeroize::Zeroizing;
 
@@ -24,6 +29,7 @@ pub const DEFAULT_LENGTH: u32 = 24;
 pub const MIN_WORDS: u32 = 3;
 pub const MAX_WORDS: u32 = 20;
 pub const DEFAULT_WORDS: u32 = 6;
+pub const MAX_BATCH: usize = 10;
 const MAX_NAME: usize = 64;
 const MAX_ITEM: usize = 128;
 const MAX_USER: usize = 128;
@@ -33,10 +39,24 @@ const MAX_SECRET: usize = 128;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Intent {
-    /// A normal read, unchanged.
-    Read,
+    /// A read, optionally asking to be remembered.
+    Read(Read),
+    /// Several reads approved on one sheet.
+    Batch(Batch),
     Create(NewLogin),
     AddTotp(AddTotp),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Read {
+    pub item: String,
+    pub remember: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batch {
+    pub items: Vec<String>,
+    pub remember: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +132,12 @@ pub enum ParseError {
     BadOtpauth,
     Hotp,
     OtpauthWithoutSecret,
+    EmptyItem,
+    BadRemember,
+    EmptyBatch,
+    TooManyItems,
+    DuplicateItem,
+    BadBatch,
 }
 
 impl fmt::Display for ParseError {
@@ -136,6 +162,12 @@ impl fmt::Display for ParseError {
             Self::BadOtpauth => "uri must be otpauth://totp/...",
             Self::Hotp => "HOTP (counter-based) seeds are not supported",
             Self::OtpauthWithoutSecret => "otpauth uri has no secret",
+            Self::EmptyItem => "request names no item",
+            Self::BadRemember => "remember must be 1m-24h, like 15m or 2h",
+            Self::EmptyBatch => "batch: needs items",
+            Self::TooManyItems => "batch: at most 10 items",
+            Self::DuplicateItem => "item listed twice",
+            Self::BadBatch => "batch: items are one comma-separated word",
         })
     }
 }
@@ -146,9 +178,104 @@ pub fn parse(what: &str) -> Result<Intent, ParseError> {
         parse_new(rest).map(Intent::Create)
     } else if let Some(rest) = strip_prefix_ci(s, "totp:") {
         parse_totp(rest).map(Intent::AddTotp)
+    } else if let Some(rest) = strip_prefix_ci(s, "batch:") {
+        parse_batch(rest).map(Intent::Batch)
     } else {
-        Ok(Intent::Read)
+        parse_read(what).map(Intent::Read)
     }
+}
+
+/// `15m`, `2h`: 1 minute to 24 hours.
+pub fn parse_span(v: &str) -> Result<Duration, ParseError> {
+    let v = v.to_ascii_lowercase();
+    let (digits, per) = if let Some(d) = v.strip_suffix('m') {
+        (d, 1u64)
+    } else if let Some(d) = v.strip_suffix('h') {
+        (d, 60)
+    } else {
+        return Err(ParseError::BadRemember);
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(ParseError::BadRemember);
+    }
+    let minutes = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(per))
+        .ok_or(ParseError::BadRemember)?;
+    if !(1..=1440).contains(&minutes) {
+        return Err(ParseError::BadRemember);
+    }
+    Ok(Duration::from_secs(minutes * 60))
+}
+
+fn is_remember(word: &str) -> bool {
+    word.get(..9)
+        .is_some_and(|p| p.eq_ignore_ascii_case("remember="))
+}
+
+fn parse_read(what: &str) -> Result<Read, ParseError> {
+    let t = what.trim_end();
+    if is_remember(t.trim_start()) {
+        return Err(ParseError::EmptyItem);
+    }
+    if let Some((head, last)) = t.rsplit_once(char::is_whitespace) {
+        if is_remember(last) {
+            let head = head.trim();
+            if head.is_empty() {
+                return Err(ParseError::EmptyItem);
+            }
+            return Ok(Read {
+                item: head.to_string(),
+                remember: Some(parse_span(&last[9..])?),
+            });
+        }
+    }
+    Ok(Read {
+        item: what.to_string(),
+        remember: None,
+    })
+}
+
+fn parse_batch(rest: &str) -> Result<Batch, ParseError> {
+    let (words, options) = split_words(rest)?;
+    let list = match words.as_slice() {
+        [] if options
+            .iter()
+            .any(|(k, _)| !k.eq_ignore_ascii_case("remember")) =>
+        {
+            return Err(ParseError::BadItem);
+        }
+        [] => return Err(ParseError::EmptyBatch),
+        [one] => *one,
+        _ => return Err(ParseError::BadBatch),
+    };
+    let mut remember = None;
+    for (key, value) in options {
+        if !key.eq_ignore_ascii_case("remember") {
+            return Err(ParseError::UnknownOption);
+        }
+        if remember.replace(parse_span(value)?).is_some() {
+            return Err(ParseError::DuplicateOption);
+        }
+    }
+    let mut items: Vec<String> = Vec::new();
+    for item in list.split(',') {
+        if item.is_empty() {
+            return Err(ParseError::EmptyBatch);
+        }
+        if item.len() > MAX_ITEM || item.chars().any(char::is_control) || item.contains('=') {
+            return Err(ParseError::BadItem);
+        }
+        if items.iter().any(|i| i.eq_ignore_ascii_case(item)) {
+            return Err(ParseError::DuplicateItem);
+        }
+        items.push(item.to_string());
+    }
+    if items.len() > MAX_BATCH {
+        return Err(ParseError::TooManyItems);
+    }
+    Ok(Batch { items, remember })
 }
 
 /// A request with anything after `totp:<item>` (up to the first `|`)
@@ -441,7 +568,14 @@ mod tests {
             "totpal.com",
             "",
         ] {
-            assert_eq!(parse(s), Ok(Intent::Read), "{s}");
+            assert_eq!(
+                parse(s),
+                Ok(Intent::Read(Read {
+                    item: s.into(),
+                    remember: None
+                })),
+                "{s}"
+            );
         }
     }
 
@@ -685,5 +819,73 @@ mod tests {
     fn debug_hides_the_seed() {
         let t = totp(&format!("totp:x secret={SEED}"));
         assert!(!format!("{t:?}").contains(SEED));
+    }
+
+    #[test]
+    fn read_remember() {
+        let r = |s: &str| parse(s);
+        assert_eq!(
+            r("github.com remember=15m"),
+            Ok(Intent::Read(Read {
+                item: "github.com".into(),
+                remember: Some(Duration::from_secs(900))
+            }))
+        );
+        assert_eq!(
+            r("My Item  REMEMBER=2h"),
+            Ok(Intent::Read(Read {
+                item: "My Item".into(),
+                remember: Some(Duration::from_secs(7200))
+            }))
+        );
+        assert_eq!(r("remember=5m"), Err(ParseError::EmptyItem));
+        for bad in [
+            "x remember=0m",
+            "x remember=25h",
+            "x remember=15",
+            "x remember=99999999999h",
+        ] {
+            assert_eq!(r(bad), Err(ParseError::BadRemember), "{bad}");
+        }
+        assert_eq!(
+            r("remember.com"),
+            Ok(Intent::Read(Read {
+                item: "remember.com".into(),
+                remember: None
+            }))
+        );
+    }
+
+    #[test]
+    fn batch_parse() {
+        assert_eq!(
+            parse("batch:a.com,b.com"),
+            Ok(Intent::Batch(Batch {
+                items: vec!["a.com".into(), "b.com".into()],
+                remember: None
+            }))
+        );
+        assert_eq!(
+            parse("BATCH:a.com remember=10m"),
+            Ok(Intent::Batch(Batch {
+                items: vec!["a.com".into()],
+                remember: Some(Duration::from_secs(600))
+            }))
+        );
+        assert_eq!(parse("batch:"), Err(ParseError::EmptyBatch));
+        assert_eq!(parse("batch:a.com,,b.com"), Err(ParseError::EmptyBatch));
+        assert_eq!(parse("batch:a.com b.com"), Err(ParseError::BadBatch));
+        let many = (0..11).map(|i| format!("h{i}.com")).collect::<Vec<_>>();
+        assert_eq!(
+            parse(&format!("batch:{}", many.join(","))),
+            Err(ParseError::TooManyItems)
+        );
+        assert_eq!(parse("batch:a.com,A.COM"), Err(ParseError::DuplicateItem));
+        assert_eq!(parse("batch:a.com foo=1"), Err(ParseError::UnknownOption));
+        assert_eq!(
+            parse("batch:a.com remember=5m remember=6m"),
+            Err(ParseError::DuplicateOption)
+        );
+        assert_eq!(parse("batch:a=b"), Err(ParseError::BadItem));
     }
 }
