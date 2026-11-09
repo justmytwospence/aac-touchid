@@ -66,6 +66,14 @@ impl Grants {
         self.list.push(g);
     }
 
+    /// Whether a live remembered grant covers this item, without using it.
+    pub fn remembers(&mut self, device: &IdentityFingerprint, item_id: &str, now: Instant) -> bool {
+        self.list.retain(|g| g.expires > now);
+        self.list
+            .iter()
+            .any(|g| g.device == *device && g.item_id == item_id && g.kind == Kind::Remembered)
+    }
+
     pub fn take(
         &mut self,
         device: &IdentityFingerprint,
@@ -149,6 +157,19 @@ mod tests {
         assert_eq!(g.take(&d, "a", Instant::now()), Some(Kind::Remembered));
         assert_eq!(g.take(&d, "a", Instant::now()), Some(Kind::Remembered));
         assert_eq!(g.take(&d, "a", expires), None);
+    }
+
+    #[test]
+    fn remembers_only_live_remembered_grants() {
+        let d = fp();
+        let mut g = Grants::default();
+        g.add(grant(d, "a", Kind::Remembered, 60));
+        g.add(grant(d, "b", Kind::Batch, 60));
+        assert!(g.remembers(&d, "a", Instant::now()));
+        assert!(g.remembers(&d, "a", Instant::now()), "not consumed");
+        assert!(!g.remembers(&d, "b", Instant::now()));
+        assert!(!g.remembers(&fp(), "a", Instant::now()));
+        assert!(!g.remembers(&d, "a", Instant::now() + Duration::from_secs(61)));
     }
 
     #[test]

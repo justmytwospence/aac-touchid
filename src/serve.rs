@@ -810,6 +810,31 @@ impl Service {
                 }
             }
         }
+        let covered = {
+            let mut s = shared(&self.shared);
+            let now = Instant::now();
+            found
+                .iter()
+                .all(|(id, _)| s.grants.remembers(&p.identity, id, now))
+        };
+        if covered {
+            // Every item is already remembered for this device: the reads
+            // that follow are released by those grants, so no new sheet.
+            self.last_activity = Instant::now();
+            self.record(&p.recipient(), &what, "approved (remembered)");
+            return release(
+                reply,
+                CredentialData {
+                    username: None,
+                    password: None,
+                    totp: None,
+                    uri: None,
+                    notes: None,
+                    credential_id: None,
+                    domain: Some(format!("batch of {} remembered", found.len())),
+                },
+            );
+        }
         let remember = b.remember.and_then(|d| self.cap(d));
         let lines: Vec<BatchLine> = found
             .iter()
