@@ -79,6 +79,49 @@ Guardrails:
 
 It replaces the interactive `aac listen` terminal app. There is nothing to keep open, and nothing an agent can type, click or send to a terminal pane can approve a request.
 
+## Fewer sheets: remember and batch
+
+Two more request forms ride in the item part of `--domain`, like `new:` and `totp:`:
+
+```sh
+# Release GitHub now, and again for 15 minutes without a sheet.
+aac run --domain "github.com remember=15m | pi · homelab | gh work" --env GH_TOKEN=password -- gh pr list
+
+# Approve several items on one sheet (each is then read once within 120 s).
+aac connect --domain "batch:github.com,npmjs.com remember=10m | pi · homelab | publish" --output json
+```
+
+- `remember=` takes `1m` to `24h` (`15m`, `2h`). The sheet says so: `Bitwarden is trying to share a password, and again for 15 min without asking`. Your touch approves both.
+- `--max-remember-minutes` (default 60; `0` turns remembering off) caps what an agent can ask for. A longer request is clamped and the sheet shows the clamped time.
+- A grant is keyed on the verified device and the resolved vault item id, never the agent's self-reported name, so `github.com` and `https://github.com/login` share one. It is in memory only.
+- `batch:` takes up to 10 comma-separated items and shows one line per item. Without `remember=` each item can be read once within 120 s; with it, the remember window applies. `new:` and `totp:` writes always get their own sheet and never use grants.
+- Locking the vault, `aac-touchid forget`, and revoking a device clear all grants. `aac-touchid status` lists them.
+
+## `aac-touchid run`
+
+`aac-touchid run` fills `bw://` references in a command's environment, then `exec`s it. With two or more items it sends one `batch:` request (one sheet), then reads each item with stock `aac connect --output json`. It also builds for Linux (the `aac-touchid-linux-x86_64` release), so the NUC can use it; `aac` must be on `PATH` there.
+
+```dotenv
+# .env.agent: references only, safe to commit
+GH_TOKEN=bw://github.com
+NPM_USER=bw://npmjs.com#username
+DATABASE_URL=postgres://${bw://db.internal#username}:${bw://db.internal#password}@db/app
+```
+
+```sh
+aac-touchid run --env-file .env.agent --agent "pi · homelab" --reason "publish release" --remember 10m -- ./release.sh
+```
+
+| Reference | Meaning |
+|---|---|
+| `bw://ITEM` | The item's password. `ITEM` is a host, an item name or an item id, with no spaces or `# } , \| = $ {` (use the item id for such names). |
+| `bw://ITEM#FIELD` | `username`, `password`, `totp` (current code), `uri`, `domain` or `credential_id`. Notes are never released. |
+| `${bw://ITEM#FIELD}` | The same, inside a longer value. |
+
+Options: `--env-file` (repeatable; later files win), `--agent` (default `$AAC_AGENT`), `--reason`, `--remember`, `--timeout` (seconds per answer, default 240). At most 10 items per run. Inherited environment variables may hold references too.
+
+Exit codes: `aac`'s own code when a request fails (2 connection, 3 auth, 4 denied or not found), 1 for `run`'s own errors, 127 or 126 when the command cannot be started. Otherwise the command's own status.
+
 ## Requirements
 
 - macOS with Touch ID (or an Apple Watch set up for approvals)
@@ -114,6 +157,10 @@ Commands:
 | `aac-touchid status` | Lock state, relay connection, paired devices, recent decisions. |
 | `aac-touchid lock` | Locks the vault now. |
 | `aac-touchid revoke <name>` | Forgets a paired device. |
+| `aac-touchid forget` | Forgets every remembered approval. |
+| `aac-touchid run [--env-file F]... -- <cmd>` | Runs a command with `bw://` references filled in (see above). Works on Linux. |
+
+`serve` also takes `--max-remember-minutes` (default 60).
 
 The vault starts locked. The first request after a restart, 8 hours idle (`--lock-after-hours`) or `lock` shows a native password dialog for your master password, then the Touch ID sheet.
 
@@ -123,7 +170,7 @@ State (identity key, paired devices) lives in `~/Library/Application Support/aac
 
 Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents, the machines they run on, and the relay.
 
-- Every credential and every write needs a biometric or Watch approval (LocalAuthentication `deviceOwnerAuthenticationWithBiometricsOrCompanion`, password fallback hidden). The sheet names the agent (self-reported) and its device (verified), the vault item, the username and the agent's stated reason.
+- Every write, and every read that is not under a grant, needs a biometric or Watch approval. A grant exists only because you approved a sheet that stated it (`remember=` or `batch:`), and writes always get their own sheet (LocalAuthentication `deviceOwnerAuthenticationWithBiometricsOrCompanion`, password fallback hidden). The sheet names the agent (self-reported) and its device (verified), the vault item, the username and the agent's stated reason.
 - Only paired devices can ask. Automatic pairing goes only to the machines named in the service's arguments, with a one-time PSK token delivered over the local process or authenticated ssh; the Noise PSK handshake binds it to that listener. Manual pairing needs a code from `aac-touchid pair` and a Touch ID approval. A code an agent obtains alone does not pair anything.
 - After a denial, the same device asking for the same item is denied silently for 60 s, and a cancelled unlock dialog is not shown again for 2 minutes, so an agent cannot spam prompts.
 - The master password and vault key never go into an environment variable or a command line, where any process of the same user can read it (`ps -E`). The listener runs one `bw serve` child on a private socket pair (`--hostname fd+connected://3`, a supported `bw serve` mode) that no other process can open; the master password travels once in its `POST /unlock` body and the vault key stays inside that child. Locking calls `/lock` and stops the child.
@@ -135,6 +182,7 @@ Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents
 
 Not covered:
 
+- Within a grant's window, any agent on that device can read that item.
 - An approved command holds that secret and can misuse it. Approve only requests you expect.
 - The sheet cannot show an agent's purpose; what the agent says in its session is its own claim.
 - A malicious process running as your macOS user, outside any sandbox, can still attack your account by other routes: replace this binary or its LaunchAgent and wait for you to unlock it, or show a fake password dialog. It still cannot touch the sensor for you. Agent sandboxes that keep agents from writing outside their project close those routes; run agents you don't trust on another machine or as another user.
