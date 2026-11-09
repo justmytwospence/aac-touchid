@@ -6,12 +6,16 @@
 mod bitwarden;
 mod control;
 mod dialog;
+mod grants;
 mod intent;
 mod provision;
+mod refs;
+mod run;
 mod serve;
 mod storage;
 mod touchid;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -42,6 +46,9 @@ enum Command {
         /// Seconds to wait for a Touch ID answer before denying.
         #[arg(long, default_value_t = 60)]
         approval_timeout: u64,
+        /// Longest `remember=` window an agent can ask for, in minutes (0 turns remembering off).
+        #[arg(long, default_value_t = 60)]
+        max_remember_minutes: u64,
         /// Keep this Mac's own `aac` paired, under this name.
         #[arg(long, value_name = "NAME")]
         pair_local: Option<String>,
@@ -64,10 +71,53 @@ enum Command {
     Lock,
     /// Forget a paired device by name (or fingerprint prefix).
     Revoke { name: String },
+    /// Forget every remembered approval now.
+    Forget,
+    /// Run a command with bw:// references in its environment filled in, after one Touch ID approval.
+    Run {
+        /// Read variables from this file (repeatable; later files win).
+        #[arg(long = "env-file", value_name = "FILE")]
+        env_file: Vec<PathBuf>,
+        /// Who is asking, shown on the sheet (default: $AAC_AGENT).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Why, shown on the sheet.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Also approve these items again for this long without asking (e.g. 15m, 2h).
+        #[arg(long, value_name = "DURATION")]
+        remember: Option<String>,
+        /// Seconds to wait for each answer (covers a master-password unlock).
+        #[arg(long, default_value_t = 240)]
+        timeout: u64,
+        /// The command, after `--`.
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let command = match cli.command {
+        Command::Run {
+            env_file,
+            agent,
+            reason,
+            remember,
+            timeout,
+            command,
+        } => {
+            return run::main(run::Args {
+                env_files: env_file,
+                agent,
+                reason,
+                remember,
+                timeout,
+                command,
+            });
+        }
+        other => other,
+    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -79,14 +129,31 @@ fn main() -> ExitCode {
         }
     };
     rt.block_on(async {
-        match cli.command {
+        match command {
             Command::Serve {
                 proxy_url,
                 lock_after_hours,
                 approval_timeout,
+                max_remember_minutes,
                 pair_local,
                 pair_ssh,
             } => {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (
+                        proxy_url,
+                        lock_after_hours,
+                        approval_timeout,
+                        max_remember_minutes,
+                        pair_local,
+                        pair_ssh,
+                    );
+                    eprintln!(
+                        "aac-touchid: serve runs only on macOS; on this machine use aac-touchid run"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                #[cfg(target_os = "macos")]
                 tracing_subscriber::fmt()
                     .with_env_filter(
                         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -99,6 +166,7 @@ fn main() -> ExitCode {
                     proxy_url,
                     lock_after: Duration::from_secs(lock_after_hours * 3600),
                     approval_timeout: Duration::from_secs(approval_timeout),
+                    max_remember: Duration::from_secs(max_remember_minutes * 60),
                     targets: pair_local
                         .iter()
                         .map(|n| provision::Target::local(n))
@@ -117,6 +185,8 @@ fn main() -> ExitCode {
             Command::Status { json } => client(control::Request::Status, json).await,
             Command::Lock => client(control::Request::Lock, false).await,
             Command::Revoke { name } => client(control::Request::Revoke { name }, false).await,
+            Command::Forget => client(control::Request::Forget, false).await,
+            Command::Run { .. } => ExitCode::FAILURE,
         }
     })
 }
@@ -184,6 +254,26 @@ async fn client(req: control::Request, json: bool) -> ExitCode {
                 r.device,
                 r.query,
                 r.outcome
+            );
+        }
+        println!("remembered approvals:");
+        if s.grants.is_empty() {
+            println!("  (none)");
+        }
+        for g in &s.grants {
+            let left = if g.expires_in < 60 {
+                format!("{}s", g.expires_in)
+            } else {
+                format!("{}m", g.expires_in / 60)
+            };
+            let uses = match g.uses_left {
+                Some(1) => ", 1 use left".to_string(),
+                Some(n) => format!(", {n} uses left"),
+                None => String::new(),
+            };
+            println!(
+                "  {}  {}  {}  expires in {left}{uses}",
+                g.item, g.device, g.kind
             );
         }
     } else if let Some(m) = &resp.message {
