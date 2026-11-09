@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use crate::bitwarden::{self, Lookup, Resolved, TotpWrite, Vault, host_of, wipe};
 use crate::control::{self, Decision, Envelope, Request, Response, Status};
 use crate::dialog;
+use crate::grants::{BATCH_WINDOW, Grant, Kind};
 use crate::intent::{self, AddTotp, Intent, NewLogin};
 use crate::storage::{FileConnections, FileIdentity, short_hex};
 use crate::touchid::{self, Outcome};
@@ -25,6 +26,8 @@ pub struct Config {
     pub proxy_url: String,
     pub lock_after: Duration,
     pub approval_timeout: Duration,
+    /// Longest `remember=` window an agent can ask for; zero turns it off.
+    pub max_remember: Duration,
     /// Machines whose `aac` this listener keeps paired.
     pub targets: Vec<crate::provision::Target>,
 }
@@ -56,6 +59,7 @@ struct Shared {
     /// Name given to the most recent `pair` request, used for the next new device.
     pending_name: Option<(String, Instant)>,
     client: Option<UserClient>,
+    grants: crate::grants::Grants,
 }
 
 type SharedRef = Arc<Mutex<Shared>>;
@@ -223,8 +227,74 @@ pub fn credential_reason(
     username: Option<&str>,
     fields: &str,
     why: Option<&str>,
+    remember: Option<Duration>,
 ) -> String {
-    sheet(&format!("share a {fields}"), who, item, username, why)
+    sheet(
+        &format!("share a {fields}{}", remember_suffix(remember)),
+        who,
+        item,
+        username,
+        why,
+    )
+}
+
+/// `1 min`, `1 h`, `1 h 30 min`.
+pub fn span(d: Duration) -> String {
+    let m = d.as_secs() / 60;
+    if m < 60 {
+        format!("{m} min")
+    } else if m % 60 == 0 {
+        format!("{} h", m / 60)
+    } else {
+        format!("{} h {} min", m / 60, m % 60)
+    }
+}
+
+fn remember_suffix(r: Option<Duration>) -> String {
+    r.map_or_else(String::new, |d| {
+        format!(", and again for {} without asking", span(d))
+    })
+}
+
+pub struct BatchLine {
+    pub name: String,
+    pub username: Option<String>,
+    pub fields: &'static str,
+}
+
+/// One sheet for several items: who, then one line per item, then why.
+pub fn batch_reason(
+    who: &str,
+    lines: &[BatchLine],
+    remember: Option<Duration>,
+    why: Option<&str>,
+) -> String {
+    let n = lines.len();
+    let items = lines
+        .iter()
+        .map(|l| {
+            let user = match l.username.as_deref() {
+                Some(u) if !u.is_empty() => format!(" ({u})"),
+                _ => String::new(),
+            };
+            format!("{}{user} \u{b7} {}", bold(&l.name), l.fields)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "share {n} login{}{}\n\n{who}\n{items}\n{}",
+        if n == 1 { "" } else { "s" },
+        remember_suffix(remember),
+        why.unwrap_or("no reason given")
+    )
+}
+
+fn with_text(q: &CredentialQuery, s: String) -> CredentialQuery {
+    match q {
+        CredentialQuery::Domain(_) => CredentialQuery::Domain(s),
+        CredentialQuery::Id(_) => CredentialQuery::Id(s),
+        CredentialQuery::Search(_) => CredentialQuery::Search(s),
+    }
 }
 
 /// `Bitwarden is trying to create a login with a 6-word passphrase and share it`.
@@ -371,6 +441,7 @@ impl Service {
             info!("locking vault: {why}");
         }
         self.vault.lock().await;
+        shared(&self.shared).grants.clear();
         self.set_unlocked();
     }
 
@@ -533,7 +604,11 @@ impl Service {
                     why: ask.why,
                 };
                 match intent {
-                    Intent::Read => self.read(p, query, reply).await,
+                    Intent::Read(r) => {
+                        let q = with_text(&query, r.item);
+                        self.read(p, q, r.remember, reply).await
+                    }
+                    Intent::Batch(b) => self.batch(p, b, reply).await,
                     Intent::Create(n) => self.create(p, n, reply).await,
                     Intent::AddTotp(t) => self.add_totp(p, t, reply).await,
                 }
@@ -596,7 +671,17 @@ impl Service {
         }
     }
 
-    async fn read(&mut self, p: Pending, query: CredentialQuery, reply: ReplyTx) {
+    fn cap(&self, d: Duration) -> Option<Duration> {
+        (!self.cfg.max_remember.is_zero()).then(|| d.min(self.cfg.max_remember))
+    }
+
+    async fn read(
+        &mut self,
+        p: Pending,
+        query: CredentialQuery,
+        remember: Option<Duration>,
+        reply: ReplyTx,
+    ) {
         let what = query_label(&query);
         if !self.admit(&p, &what).await {
             return deny(reply);
@@ -626,6 +711,17 @@ impl Service {
                 return deny(reply);
             }
         };
+        if let Some(id) = credential.credential_id.as_deref() {
+            let kind = shared(&self.shared)
+                .grants
+                .take(&p.identity, id, Instant::now());
+            if let Some(kind) = kind {
+                self.last_activity = Instant::now();
+                self.record(&p.recipient(), &what, kind.outcome());
+                return release(reply, *credential);
+            }
+        }
+        let remember = remember.and_then(|d| self.cap(d));
         let domain = credential
             .domain
             .clone()
@@ -637,12 +733,129 @@ impl Service {
             credential.username.as_deref(),
             fields.describe(),
             p.why.as_deref(),
+            remember,
         );
         if !self.approve(&p, &what, reason).await {
             return deny(reply);
         }
+        if let (Some(d), Some(id)) = (remember, credential.credential_id.clone()) {
+            shared(&self.shared).grants.add(Grant {
+                device: p.identity,
+                device_label: p.device.clone(),
+                item_id: id,
+                item: item.clone(),
+                kind: Kind::Remembered,
+                expires: Instant::now() + d,
+                uses_left: None,
+            });
+        }
         self.record(&p.recipient(), &what, "approved");
         release(reply, *credential);
+    }
+
+    /// Several items on one sheet; approval leaves grants the client's
+    /// following reads use.
+    async fn batch(&mut self, p: Pending, b: intent::Batch, reply: ReplyTx) {
+        let what = format!("batch {}", b.items.join(","));
+        if !self.admit(&p, &what).await {
+            return deny(reply);
+        }
+        let mut found: Vec<(String, BatchLine)> = Vec::new();
+        for item in &b.items {
+            match self
+                .vault
+                .lookup(&CredentialQuery::Domain(item.clone()))
+                .await
+            {
+                Lookup::Found(c, name, fields) => {
+                    let Some(id) = c.credential_id.clone() else {
+                        self.record(&p.device, &what, "refused (item has no id)");
+                        return deny(reply);
+                    };
+                    if found.iter().any(|(i, _)| *i == id) {
+                        continue;
+                    }
+                    found.push((
+                        id,
+                        BatchLine {
+                            name: name
+                                .or_else(|| c.domain.clone())
+                                .unwrap_or_else(|| item.clone()),
+                            username: c.username.clone(),
+                            fields: fields.describe(),
+                        },
+                    ));
+                }
+                Lookup::Locked => {
+                    self.lock("bw reported the vault locked").await;
+                    self.record(&p.device, &what, "denied (vault locked)");
+                    return deny(reply);
+                }
+                Lookup::NotFound => {
+                    self.record(&p.device, &what, &format!("not found: {item}"));
+                    return deny(reply);
+                }
+                Lookup::Ambiguous(n) => {
+                    self.record(
+                        &p.device,
+                        &what,
+                        &format!("ambiguous: {item} ({n} logins match; request by item id)"),
+                    );
+                    return deny(reply);
+                }
+                Lookup::Error(e) => {
+                    warn!("lookup error: {e}");
+                    self.record(&p.device, &what, "error");
+                    return deny(reply);
+                }
+            }
+        }
+        let remember = b.remember.and_then(|d| self.cap(d));
+        let lines: Vec<BatchLine> = found
+            .iter()
+            .map(|(_, l)| BatchLine {
+                name: l.name.clone(),
+                username: l.username.clone(),
+                fields: l.fields,
+            })
+            .collect();
+        let reason = batch_reason(&p.who, &lines, remember, p.why.as_deref());
+        if !self.approve(&p, &what, reason).await {
+            return deny(reply);
+        }
+        let now = Instant::now();
+        let n = found.len();
+        {
+            let mut s = shared(&self.shared);
+            for (id, line) in found {
+                let (kind, expires, uses_left) = match remember {
+                    Some(d) => (Kind::Remembered, now + d, None),
+                    None => (Kind::Batch, now + BATCH_WINDOW, Some(1)),
+                };
+                s.grants.add(Grant {
+                    device: p.identity,
+                    device_label: p.device.clone(),
+                    item_id: id,
+                    item: line.name,
+                    kind,
+                    expires,
+                    uses_left,
+                });
+            }
+        }
+        self.record(&p.recipient(), &what, "approved (batch)");
+        release(
+            reply,
+            CredentialData {
+                username: None,
+                password: None,
+                totp: None,
+                uri: None,
+                notes: None,
+                credential_id: None,
+                domain: Some(format!("batch of {n} approved")),
+            },
+        );
     }
 
     /// Whether `new:` may go ahead: nothing by that name or host exists yet.
@@ -860,7 +1073,8 @@ async fn control_handler(
     while let Some((req, reply)) = rx.recv().await {
         let response = match req {
             Request::Status => {
-                let s = shared(&shared_state);
+                let mut s = shared(&shared_state);
+                let grants = s.grants.snapshot(Instant::now());
                 Response {
                     ok: true,
                     status: Some(Status {
@@ -870,6 +1084,7 @@ async fn control_handler(
                             .map(|c| c.devices())
                             .unwrap_or_default(),
                         recent: s.recent.iter().cloned().collect(),
+                        grants,
                     }),
                     ..Default::default()
                 }
@@ -893,6 +1108,10 @@ async fn control_handler(
                         }
                     }
                 }
+            }
+            Request::Forget => {
+                let n = shared(&shared_state).grants.clear();
+                Response::ok(format!("forgot {n} remembered approval(s)"))
             }
             Request::Lock => {
                 let (tx, rx2) = tokio::sync::oneshot::channel();
@@ -1051,7 +1270,10 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let result = FileConnections::load(&dir).and_then(|mut c| c.remove(&name));
             let _ = reply.send(match result {
                 Ok(0) => Response::err(format!("no paired device named {name}")),
-                Ok(n) => Response::ok(format!("revoked {n} device(s) named {name}")),
+                Ok(n) => {
+                    shared(&shared_state).grants.clear();
+                    Response::ok(format!("revoked {n} device(s) named {name}"))
+                }
                 Err(e) => Response::err(format!("revoke failed: {e}")),
             });
         } else {
@@ -1076,7 +1298,8 @@ mod tests {
                 "GitHub",
                 Some("me@x.com"),
                 "password + 2FA code",
-                Some("log in with gh")
+                Some("log in with gh"),
+                None
             ),
             format!(
                 "share a password + 2FA code\n\n{who}\n{} (me@x.com)\nlog in with gh",
@@ -1084,7 +1307,7 @@ mod tests {
             )
         );
         assert_eq!(
-            credential_reason("n", "x", None, "password", None),
+            credential_reason("n", "x", None, "password", None, None),
             "share a password\n\nn\n\u{1D605}\nno reason given"
         );
         assert_eq!(
@@ -1236,5 +1459,44 @@ mod tests {
             "x.com"
         );
         assert_eq!(query_label(&CredentialQuery::Id("abc".into())), "item abc");
+    }
+
+    #[test]
+    fn remember_and_batch_sheets() {
+        assert_eq!(span(Duration::from_secs(60)), "1 min");
+        assert_eq!(span(Duration::from_secs(3600)), "1 h");
+        assert_eq!(span(Duration::from_secs(5400)), "1 h 30 min");
+        assert!(
+            credential_reason(
+                "w",
+                "x",
+                None,
+                "password",
+                None,
+                Some(Duration::from_secs(900))
+            )
+            .starts_with("share a password, and again for 15 min without asking\n\n")
+        );
+        let lines = [
+            BatchLine {
+                name: "GitHub".into(),
+                username: Some("me".into()),
+                fields: "password",
+            },
+            BatchLine {
+                name: "npm".into(),
+                username: None,
+                fields: "password + 2FA code",
+            },
+        ];
+        assert_eq!(
+            batch_reason("w", &lines, None, Some("ship")),
+            format!(
+                "share 2 logins\n\nw\n{} (me) \u{b7} password\n{} \u{b7} password + 2FA code\nship",
+                bold("GitHub"),
+                bold("npm")
+            )
+        );
+        assert!(batch_reason("w", &lines[..1], None, None).starts_with("share 1 login\n"));
     }
 }

@@ -20,6 +20,7 @@ pub enum Request {
     Status,
     Lock,
     Revoke { name: String },
+    Forget,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,11 +32,22 @@ pub struct Decision {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrantInfo {
+    pub device: String,
+    pub item: String,
+    pub kind: String,
+    pub expires_in: u64,
+    pub uses_left: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
     pub unlocked: bool,
     pub relay: String,
     pub devices: Vec<Device>,
     pub recent: Vec<Decision>,
+    #[serde(default)]
+    pub grants: Vec<GrantInfo>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +153,13 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"cmd":"status"}"#).expect("parse");
         assert_eq!(r, Request::Status);
         assert!(serde_json::from_str::<Request>(r#"{"cmd":"approve"}"#).is_err());
+        let r: Request = serde_json::from_str(r#"{"cmd":"forget"}"#).expect("parse");
+        assert_eq!(r, Request::Forget);
+        let s: Status = serde_json::from_str(
+            r#"{"unlocked":true,"relay":"connected","devices":[],"recent":[]}"#,
+        )
+        .expect("parse");
+        assert!(s.grants.is_empty());
     }
 
     #[tokio::test]
