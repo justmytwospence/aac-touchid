@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::bitwarden::{self, Lookup, Resolved, TotpWrite, Vault, host_of, wipe};
+use crate::bitwarden::{self, Conflict, Lookup, Resolved, TotpWrite, Vault, host_of, wipe};
 use crate::control::{self, Decision, Envelope, Request, Response, Status};
 use crate::dialog;
 use crate::grants::{BATCH_WINDOW, Grant, Kind};
@@ -883,14 +883,19 @@ impl Service {
         );
     }
 
-    /// Whether `new:` may go ahead: nothing by that name or host exists yet.
-    /// Records why not.
-    async fn may_create(&mut self, p: &Pending, what: &str, n: &NewLogin) -> bool {
-        let host = n.uri.as_deref().and_then(host_of);
-        match self.vault.exists(&n.name, host.as_deref()).await {
-            Ok(false) => true,
-            Ok(true) => {
-                self.record(&p.device, what, "refused (already exists)");
+    /// Whether `new:` or `save:` may go ahead: nothing by that name, and no
+    /// login a read of the host would find. Records why not, naming only
+    /// what the request supplied.
+    async fn may_create(&mut self, p: &Pending, what: &str, name: &str, uri: Option<&str>) -> bool {
+        let host = uri.and_then(host_of);
+        match self.vault.exists(name, host.as_deref()).await {
+            Ok(None) => true,
+            Ok(Some(conflict)) => {
+                let why = match conflict {
+                    Conflict::Name => "an item with that name".to_string(),
+                    Conflict::Host(h) => format!("a login for {h}"),
+                };
+                self.record(&p.device, what, &format!("refused (already exists: {why})"));
                 false
             }
             Err(e) => {
@@ -904,7 +909,7 @@ impl Service {
         let what = format!("new {}", n.name);
         if !self.admit(&p, &what).await
             || !self.sync(&p, &what).await
-            || !self.may_create(&p, &what, &n).await
+            || !self.may_create(&p, &what, &n.name, n.uri.as_deref()).await
         {
             return deny(reply);
         }
@@ -915,7 +920,9 @@ impl Service {
             &n.secret.describe(),
             p.why.as_deref(),
         );
-        if !self.approve(&p, &what, reason).await || !self.may_create(&p, &what, &n).await {
+        if !self.approve(&p, &what, reason).await
+            || !self.may_create(&p, &what, &n.name, n.uri.as_deref()).await
+        {
             return deny(reply);
         }
         let written = async {

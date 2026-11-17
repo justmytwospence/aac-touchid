@@ -83,6 +83,15 @@ pub struct NewLogin<'a> {
     pub notes: &'a str,
 }
 
+/// Why a `new:` or `save:` found something already there.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Conflict {
+    /// An item with that name.
+    Name,
+    /// A login a read of this host would find.
+    Host(String),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum TotpWrite {
     Stored,
@@ -495,10 +504,15 @@ impl Vault {
     }
 
     /// Whether the vault already has an item with this name (exact, any
-    /// case) or a login for this host.
-    pub async fn exists(&mut self, name: &str, host: Option<&str>) -> Result<bool, String> {
+    /// case) or a login a read of this host would find in its exact tier
+    /// (see [`on_host`]).
+    pub async fn exists(
+        &mut self,
+        name: &str,
+        host: Option<&str>,
+    ) -> Result<Option<Conflict>, String> {
         let mut searches = vec![name];
-        if let Some(h) = host.filter(|h| !h.eq_ignore_ascii_case(name)) {
+        if let Some(h) = host.map(bare).filter(|h| !h.eq_ignore_ascii_case(name)) {
             searches.push(h);
         }
         for search in searches {
@@ -510,23 +524,27 @@ impl Vault {
                 )
                 .await?;
             let checked = self.check(&reply);
-            let hit = reply["data"]["data"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|i| {
-                    i["name"]
-                        .as_str()
-                        .is_some_and(|n| n.trim().eq_ignore_ascii_case(name))
-                        || host.is_some_and(|h| login_hosts(i).any(|x| x == h))
-                });
+            let items = reply["data"]["data"].as_array().into_iter().flatten();
+            let mut hit = None;
+            for i in items {
+                if i["name"]
+                    .as_str()
+                    .is_some_and(|n| n.trim().eq_ignore_ascii_case(name))
+                {
+                    hit = Some(Conflict::Name);
+                    break;
+                }
+                if let Some(h) = host.filter(|h| on_host(i, h)) {
+                    hit = Some(Conflict::Host(h.to_string()));
+                }
+            }
             wipe(&mut reply);
             checked?;
-            if hit {
-                return Ok(true);
+            if hit.is_some() {
+                return Ok(hit);
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Create a login in `folder_id`. Returns the new item's id.
@@ -732,15 +750,6 @@ async fn roundtrip(
     serde_json::from_slice(&data).map_err(|e| format!("parse reply: {e}"))
 }
 
-/// Hosts of a vault item's login URIs.
-pub fn login_hosts(item: &Value) -> impl Iterator<Item = String> + '_ {
-    item["login"]["uris"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|u| u["uri"].as_str().and_then(host_of))
-}
-
 /// Bitwarden URI match detection values whose URI is not a plain address:
 /// regular expression (4) and never (5).
 const NOT_A_HOST_MATCH: &[u64] = &[4, 5];
@@ -810,22 +819,26 @@ pub fn host_query(search: &str) -> Option<String> {
 /// matches of names, URIs or usernames never count, and URIs set to never
 /// match or to a regular expression are skipped.
 pub fn pick_by_host(items: &[Value], host: &str) -> Pick {
-    let q = bare(host);
-    let dot_q = format!(".{q}");
-    let logins = |i: &Value| i["login"].is_object();
-    let exact = pick_where(items, |i| {
-        logins(i)
-            && (matching_hosts(i).any(|h| bare(&h) == q)
-                || i["name"]
-                    .as_str()
-                    .is_some_and(|n| bare(&n.trim().to_ascii_lowercase()) == q))
-    });
+    let dot_q = format!(".{}", bare(host));
+    let exact = pick_where(items, |i| on_host(i, host));
     if exact != Pick::None {
         return exact;
     }
     pick_where(items, |i| {
-        logins(i) && matching_hosts(i).any(|h| h.ends_with(&dot_q))
+        i["login"].is_object() && matching_hosts(i).any(|h| h.ends_with(&dot_q))
     })
+}
+
+/// Whether a login is in the first tier for a host: a URI on exactly that
+/// host, or a name that is exactly that host (`www.` ignored on both sides;
+/// URIs set to never match or to a regular expression do not count).
+pub fn on_host(item: &Value, host: &str) -> bool {
+    let q = bare(host);
+    item["login"].is_object()
+        && (matching_hosts(item).any(|h| bare(&h) == q)
+            || item["name"]
+                .as_str()
+                .is_some_and(|n| bare(&n.trim().to_ascii_lowercase()) == q))
 }
 
 /// Choose among several search results the one named exactly `name` (any
@@ -937,6 +950,28 @@ mod tests {
             .map(|(u, m)| serde_json::json!({ "uri": u, "match": m }))
             .collect();
         serde_json::json!({ "type": 1, "name": name, "login": { "uris": uris } })
+    }
+
+    #[test]
+    fn duplicate_guard_matches_like_reads() {
+        let host = "speedtest.example.com";
+        let on = |item: Value| on_host(&item, host);
+        assert!(on(login(
+            "X",
+            &[("https://www.speedtest.example.com", None)]
+        )));
+        assert!(on(login(host, &[])));
+        assert!(!on(login(
+            "X",
+            &[("https://speedtest.example.com", Some(5))]
+        )));
+        assert!(!on(login("X", &[("speedtest\\.example\\.com", Some(4))])));
+        assert!(!on(login(
+            "X",
+            &[("https://login.speedtest.example.com", None)]
+        )));
+        assert!(!on(login("X", &[("https://example.com", None)])));
+        assert!(!on(serde_json::json!({ "type": 2, "name": host })));
     }
 
     #[test]
@@ -1194,9 +1229,12 @@ while True:
         assert_eq!(v.agent_folder(false).await, Ok(None));
         assert_eq!(v.agent_folder(true).await, Ok(Some("f1".to_string())));
         assert_eq!(v.agent_folder(false).await, Ok(Some("f1".to_string())));
-        assert_eq!(v.exists("Acme", Some("acme.io")).await, Ok(false));
-        assert_eq!(v.exists("github", None).await, Ok(true));
-        assert_eq!(v.exists("Other", Some("github.com")).await, Ok(true));
+        assert_eq!(v.exists("Acme", Some("acme.io")).await, Ok(None));
+        assert_eq!(v.exists("github", None).await, Ok(Some(Conflict::Name)));
+        assert_eq!(
+            v.exists("Other", Some("github.com")).await,
+            Ok(Some(Conflict::Host("github.com".to_string())))
+        );
         let id = v
             .create_login(&NewLogin {
                 name: "Acme",
@@ -1209,7 +1247,7 @@ while True:
             .await
             .expect("create");
         assert_eq!(id, "n1");
-        assert_eq!(v.exists("acme", None).await, Ok(true));
+        assert_eq!(v.exists("acme", None).await, Ok(Some(Conflict::Name)));
         let Resolved::Item(item) = v.resolve(&id).await else {
             panic!("new item not found")
         };
