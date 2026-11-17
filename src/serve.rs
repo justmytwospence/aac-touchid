@@ -20,7 +20,7 @@ use crate::bitwarden::{
 use crate::control::{self, Decision, Envelope, Request, Response, Status};
 use crate::dialog;
 use crate::grants::{BATCH_WINDOW, Grant, Kind};
-use crate::intent::{self, AddTotp, Intent, NewLogin, Rotate};
+use crate::intent::{self, AddTotp, Intent, NewLogin, Rotate, SaveLogin};
 use crate::storage::{FileConnections, FileIdentity, short_hex};
 use crate::touchid::{self, Outcome};
 
@@ -331,6 +331,17 @@ pub fn rotate_reason(
         &format!("replace a password with a {secret} and share it"),
         who,
         item,
+        username,
+        why,
+    )
+}
+
+/// `Bitwarden is trying to save a password the agent supplied`.
+pub fn save_reason(who: &str, name: &str, username: Option<&str>, why: Option<&str>) -> String {
+    sheet(
+        "save a password the agent supplied",
+        who,
+        name,
         username,
         why,
     )
@@ -658,6 +669,7 @@ impl Service {
                     Intent::Batch(b) => self.batch(p, b, reply).await,
                     Intent::Create(n) => self.create(p, n, reply).await,
                     Intent::AddTotp(t) => self.add_totp(p, t, reply).await,
+                    Intent::Save(n) => self.save(p, n, reply).await,
                     Intent::Rotate(r) => self.rotate(p, r, reply).await,
                     Intent::Why => self.why(p, reply),
                 }
@@ -1042,6 +1054,70 @@ impl Service {
                 domain: Some(text),
             },
         );
+    }
+
+    /// Store a password the agent already has as a new login. The agent has
+    /// the password, so nothing but the username, URI and item id comes back.
+    async fn save(&mut self, p: Pending, n: SaveLogin, reply: ReplyTx) {
+        let what = format!("save {}", n.name);
+        if !self.admit(&p, &what).await
+            || !self.sync(&p, &what).await
+            || !self.may_create(&p, &what, &n.name, n.uri.as_deref()).await
+        {
+            return deny(reply);
+        }
+        let reason = save_reason(&p.who, &n.name, n.username.as_deref(), p.why.as_deref());
+        if !self.approve(&p, &what, reason).await
+            || !self.may_create(&p, &what, &n.name, n.uri.as_deref()).await
+        {
+            return deny(reply);
+        }
+        let written = async {
+            let folder = self
+                .vault
+                .agent_folder(true)
+                .await?
+                .ok_or("no Agent-created folder")?;
+            let notes = format!(
+                "Saved by aac-touchid for {} on {}: {}",
+                p.agent.as_deref().unwrap_or("an agent"),
+                p.device,
+                p.why.as_deref().unwrap_or("no reason given")
+            );
+            self.vault
+                .create_login(&bitwarden::NewLogin {
+                    name: &n.name,
+                    username: n.username.as_deref(),
+                    password: &n.password,
+                    uri: n.uri.as_deref(),
+                    folder_id: &folder,
+                    notes: &notes,
+                })
+                .await
+        }
+        .await;
+        match written {
+            Ok(id) => {
+                self.after_write().await;
+                self.record(&p.recipient(), &what, "saved");
+                release(
+                    reply,
+                    CredentialData {
+                        username: n.username,
+                        password: None,
+                        totp: None,
+                        uri: n.uri,
+                        notes: None,
+                        credential_id: Some(id),
+                        domain: None,
+                    },
+                );
+            }
+            Err(e) => {
+                self.vault_error(&p, &what, &e).await;
+                deny(reply);
+            }
+        }
     }
 
     /// The one vault item a request names, found like a read finds it (a
@@ -1548,6 +1624,13 @@ mod tests {
             )
         );
         assert_eq!(
+            save_reason(&who, "Acme", Some("bot"), Some("store login")),
+            format!(
+                "save a password the agent supplied\n\n{who}\n{} (bot)\nstore login",
+                bold("Acme")
+            )
+        );
+        assert_eq!(
             totp_reason(&who, "Acme", Some("bot"), Some("enroll 2FA")),
             format!(
                 "add 2FA and share a 2FA code\n\n{who}\n{} (bot)\nenroll 2FA",
@@ -1597,6 +1680,7 @@ mod tests {
             format!("totp:acme.io secret={seed} | pi | enroll"),
             format!("totp:acme.io uri=otpauth://totp/a?secret={seed}"),
             format!("totp:acme.io secret={seed} {seed}"),
+            format!("save:Acme Corp user=a password64={seed} | pi | store"),
         ] {
             for q in [
                 CredentialQuery::Domain(raw.clone()),

@@ -52,6 +52,7 @@ aac run --domain "totp:acme.io secret=JBSWY3DPEHPK3PXP | pi · homelab | enroll 
 |---|---|
 | `new:<name> [user=<u>] [url=<full url>] [words=3-20]` | Creates a login named `<name>` with a passphrase from `bw`'s generator and releases username, password, URI and item id. The default is 6 capitalized words joined by `-`, one with a digit (`Violet-Shrug0-Broken-Lantern-Mosaic-Thirsty`); `words=` sets the count. For a random password instead, give `length=12-128` (default 24) and/or `symbols=no`; these cannot be combined with `words=`. If `<name>` looks like a host (`acme.io`), the URI defaults to `https://<name>`. |
 | `rotate:<item> [words=3-20] [length=12-128] [symbols=no]` | Replaces the password of an existing login with a generated one (the same formats as `new:`) and releases its username, new password, URI and item id. `<item>` is found like a read finds it: name the host you sign in on (`rotate:speedtest.example.com`), or use an item id. The old password stays in the item's password history. |
+| `save:<name> [user=<u>] [url=<full url>] password64=<base64>` | Stores a password the agent already has as a new login (for example one it read from a config file) and releases the username, URI and item id, not the password. `password64` is the password in base64 (standard or URL-safe, 1-512 bytes of text), so characters like `\|`, `=` and spaces survive the request format. |
 | `totp:<item> secret=<base32>` | Stores a TOTP seed on a login and releases its username and current code, so the agent can confirm enrollment. |
 | `totp:<item> uri=otpauth://totp/...?secret=...` | The same, from an `otpauth://` URI; its other parameters (digits, period, algorithm) are kept. |
 | anything else | A normal read, unchanged. |
@@ -64,6 +65,11 @@ aac run --domain "rotate:speedtest.example.com | pi · homelab | rotate admin pa
   --env P=password -- ./set-password.sh
 ```
 
+```sh
+# Store a password you already have. Prefer rotate: when the service allows it.
+aac connect --domain "save:Letterboxarr user=admin url=https://letterboxarr.example.com password64=$(printf %s "$PW" | base64 | tr -d '\n') | pi · homelab | store existing login" --output json
+```
+
 Each write shows its own Touch ID sheet. A new login's sheet names the password format (`6-word passphrase`, `32-character password`, `24-character password without symbols`), never the password:
 
 > Bitwarden is trying to create a login with a 6-word passphrase and share it
@@ -71,6 +77,8 @@ Each write shows its own Touch ID sheet. A new login's sheet names the password 
 > **𝗽𝗶 · 𝗵𝗼𝗺𝗲𝗹𝗮𝗯** (nuc)
 > **𝗮𝗰𝗺𝗲.𝗶𝗼** (bot@example.com)
 > sign up for Acme
+
+> Bitwarden is trying to save a password the agent supplied
 
 > Bitwarden is trying to replace a password with a 6-word passphrase and share it
 
@@ -82,6 +90,7 @@ Guardrails:
 - Writes go straight to the Bitwarden server. The listener syncs its vault before a write's checks (refusing if that fails) and again after the write. Other Bitwarden apps pick up the change by their usual push notification or next sync.
 - New logins go in the folder `Agent-created` (created on first use), with a note naming the agent, device and reason.
 - `rotate:` works on any login that resolves to exactly one item, yours included, and only after its own sheet. The old password is never released; it stays in the item's password history, and the outcome says if it did not (`rotated (old password not kept in history)`).
+- `save:` has the same duplicate guard as `new:`. The login goes in `Agent-created` with a note naming the agent, device and reason. The password sits in `aac`'s command line while it runs, like a `totp:` seed, and logs and `status` show `save:<name> [redacted]`. Rotating is better whenever the service allows it, because the agent then never sees the password.
 - `totp:` works only on a login that resolves to exactly one item, sits in `Agent-created`, and has no 2FA seed. An agent can never add 2FA to a login you made, and never overwrites a seed; the item is read again after approval to make sure.
 - `totp:` releases only the username and the current code, never the seed or the password.
 - Malformed requests are refused without a sheet: unknown or repeated options, more than one seed, HOTP (`otpauth://hotp/`), an `otpauth` URI without a secret, a length outside 12-128, a word count outside 3-20, or `words=` mixed with `length=`/`symbols=`. Error messages never repeat the request.
@@ -197,7 +206,7 @@ Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents
 - `bw login --apikey` reads the API key only from its environment, so on first login the key is in that one short-lived child's environment. The API key alone cannot decrypt the vault.
 - `why:` releases only the asking device's own decision records (request labels and outcomes), without a sheet.
 - Only username, password, URI and the current 2FA code (never the TOTP seed) are released.
-- A `totp:` seed is in the requesting machine's `aac` command line while it runs, where processes of the same user there can read it, and the agent has seen it once on the signup page. It leaves the listener only inside the encrypted vault: logs and `status` show `totp:<item> [redacted]` and `2FA <item>`. Generated passwords and seeds are wiped from the listener's request buffers after use.
+- A `totp:` seed or `save:` password is in the requesting machine's `aac` command line while it runs, where processes of the same user there can read it, and the agent has seen it once on the signup page. It leaves the listener only inside the encrypted vault: logs and `status` show `totp:<item> [redacted]` and `2FA <item>`. Generated passwords and seeds are wiped from the listener's request buffers after use.
 - Agent names are reduced to letters, digits, spaces and `· . - _ / @`, so a name cannot fake a device suffix or extra lines. Pairing completes only within 5 minutes of `aac-touchid pair`, and the sheet names the device and when its code was issued.
 - The relay sees only device fingerprints and timing (Noise protocol, end to end).
 

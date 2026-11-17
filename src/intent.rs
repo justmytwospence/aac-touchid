@@ -6,6 +6,8 @@
 //! - `new:<name> [user=<u>] [url=<full url>] [words=3-20]` creates a login
 //!   with a generated six-word passphrase (`Violet-Shrug0-Broken-...`), or with
 //!   `[length=12-128] [symbols=no]` a random password.
+//! - `save:<name> [user=<u>] [url=<full url>] password64=<base64>` stores a
+//!   password the agent already has as a new login.
 //! - `rotate:<item> [words=3-20] [length=12-128] [symbols=no]` replaces the
 //!   password of an existing login with a generated one.
 //! - `totp:<item> secret=<base32>` or `totp:<item> uri=otpauth://totp/...`
@@ -38,6 +40,8 @@ const MAX_NAME: usize = 64;
 const MAX_ITEM: usize = 128;
 const MAX_USER: usize = 128;
 const MAX_URL: usize = 2048;
+const MAX_SAVED: usize = 512;
+const MAX_B64: usize = 700;
 const MIN_SECRET: usize = 16;
 const MAX_SECRET: usize = 128;
 
@@ -50,6 +54,7 @@ pub enum Intent {
     Create(NewLogin),
     AddTotp(AddTotp),
     Rotate(Rotate),
+    Save(SaveLogin),
     /// The device's own recent decisions, no sheet.
     Why,
 }
@@ -107,6 +112,26 @@ pub struct Rotate {
     pub secret: Generator,
 }
 
+/// A login the agent already has the password for.
+#[derive(PartialEq, Eq)]
+pub struct SaveLogin {
+    pub name: String,
+    pub username: Option<String>,
+    pub uri: Option<String>,
+    pub password: Zeroizing<String>,
+}
+
+impl fmt::Debug for SaveLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SaveLogin")
+            .field("name", &self.name)
+            .field("username", &self.username)
+            .field("uri", &self.uri)
+            .field("password", &"[redacted]")
+            .finish()
+    }
+}
+
 #[derive(PartialEq, Eq)]
 pub struct AddTotp {
     /// One word: a domain, an item name without spaces, or an item id.
@@ -140,6 +165,8 @@ pub enum ParseError {
     BadSymbols,
     BadWords,
     MixedGenerators,
+    MissingPassword,
+    BadPassword,
     MissingSeed,
     DuplicateSeed,
     BadSecret,
@@ -170,6 +197,10 @@ impl fmt::Display for ParseError {
             Self::BadSymbols => "symbols must be yes or no",
             Self::BadWords => "words must be 3-20",
             Self::MixedGenerators => "words= cannot be combined with length= or symbols=",
+            Self::MissingPassword => "save: needs password64=",
+            Self::BadPassword => {
+                "password64 must be base64 of 1-512 bytes of text without control characters"
+            }
             Self::MissingSeed => "totp: needs secret= or uri=",
             Self::DuplicateSeed => "more than one seed given",
             Self::BadSecret => "secret must be base32 (A-Z, 2-7), 16-128 characters",
@@ -190,6 +221,8 @@ pub fn parse(what: &str) -> Result<Intent, ParseError> {
     let s = what.trim();
     if let Some(rest) = strip_prefix_ci(s, "new:") {
         parse_new(rest).map(Intent::Create)
+    } else if let Some(rest) = strip_prefix_ci(s, "save:") {
+        parse_save(rest).map(Intent::Save)
     } else if let Some(rest) = strip_prefix_ci(s, "totp:") {
         parse_totp(rest).map(Intent::AddTotp)
     } else if let Some(rest) = strip_prefix_ci(s, "rotate:") {
@@ -300,22 +333,31 @@ fn parse_batch(rest: &str) -> Result<Batch, ParseError> {
     Ok(Batch { items, remember })
 }
 
-/// A request with anything after `totp:<item>` (up to the first `|`)
-/// removed, safe to log.
+/// A request with anything after `totp:<item>` or `save:<name>` (up to the
+/// first `|`) removed, safe to log.
 pub fn redact(raw: &str) -> String {
     let lead = raw.len() - raw.trim_start().len();
     let s = &raw[lead..];
-    let Some(rest) = strip_prefix_ci(s, "totp:") else {
+    let (prefix, many) = if strip_prefix_ci(s, "totp:").is_some() {
+        (&s[..5], false)
+    } else if strip_prefix_ci(s, "save:").is_some() {
+        // A name may have spaces; everything from the first option on goes.
+        (&s[..5], true)
+    } else {
         return raw.to_string();
     };
+    let rest = &s[5..];
     let (head, tail) = rest.find('|').map_or((rest, ""), |i| rest.split_at(i));
-    let item = head
-        .split_whitespace()
-        .next()
-        .filter(|w| !w.contains('='))
-        .unwrap_or_default();
-    let dropped = head.split_whitespace().count() > usize::from(!item.is_empty());
-    let mut out = format!("{}{}", &s[..5], item);
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let kept: Vec<&str> = words
+        .iter()
+        .copied()
+        .take_while(|w| !w.contains('='))
+        .take(if many { usize::MAX } else { 1 })
+        .collect();
+    let item = kept.join(" ");
+    let dropped = words.len() > kept.len();
+    let mut out = format!("{prefix}{item}");
     if dropped {
         out.push_str(if item.is_empty() {
             "[redacted]"
@@ -477,6 +519,75 @@ fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
         uri,
         secret: generator.finish()?,
     })
+}
+
+fn parse_save(rest: &str) -> Result<SaveLogin, ParseError> {
+    let (words, options) = split_words(rest)?;
+    let name = parse_name(&words)?;
+    let mut username = None;
+    let mut url = None;
+    let mut password: Option<Zeroizing<String>> = None;
+    for (key, value) in options {
+        let slot_taken = match key.to_ascii_lowercase().as_str() {
+            "user" => username.replace(parse_user(value)?).is_some(),
+            "url" => url.replace(parse_url(value)?).is_some(),
+            "password64" => password.replace(parse_password64(value)?).is_some(),
+            _ => return Err(ParseError::UnknownOption),
+        };
+        if slot_taken {
+            return Err(ParseError::DuplicateOption);
+        }
+    }
+    let uri = url.or_else(|| default_uri(&name));
+    Ok(SaveLogin {
+        name,
+        username,
+        uri,
+        password: password.ok_or(ParseError::MissingPassword)?,
+    })
+}
+
+fn parse_password64(value: &str) -> Result<Zeroizing<String>, ParseError> {
+    if value.len() > MAX_B64 {
+        return Err(ParseError::BadPassword);
+    }
+    let bytes = decode_base64(value).ok_or(ParseError::BadPassword)?;
+    let text = String::from_utf8(bytes.to_vec())
+        .map(Zeroizing::new)
+        .map_err(|_| ParseError::BadPassword)?;
+    if text.is_empty() || text.len() > MAX_SAVED || text.chars().any(char::is_control) {
+        return Err(ParseError::BadPassword);
+    }
+    Ok(text)
+}
+
+/// Standard or URL-safe base64, padding optional.
+fn decode_base64(s: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let s = s.trim_end_matches('=');
+    if s.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(s.len() * 3 / 4));
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for b in s.bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 fn parse_rotate(rest: &str) -> Result<Rotate, ParseError> {
@@ -678,6 +789,69 @@ mod tests {
         ] {
             assert_eq!(parse(input), Err(err), "{input}");
         }
+    }
+
+    fn save(s: &str) -> SaveLogin {
+        match parse(s) {
+            Ok(Intent::Save(v)) => v,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // base64 of "hunter2|pipe"
+    const PW64: &str = "aHVudGVyMnxwaXBl";
+
+    #[test]
+    fn save_decodes() {
+        let s = save(&format!(
+            "save:Letterboxarr user=admin url=https://lbx.example.com password64={PW64}"
+        ));
+        assert_eq!(s.name, "Letterboxarr");
+        assert_eq!(s.username.as_deref(), Some("admin"));
+        assert_eq!(s.uri.as_deref(), Some("https://lbx.example.com"));
+        assert_eq!(s.password.as_str(), "hunter2|pipe");
+        assert!(!format!("{s:?}").contains("hunter2"));
+        // Unpadded, padded and URL-safe forms.
+        assert_eq!(save("save:a password64=YWI").password.as_str(), "ab");
+        assert_eq!(save("save:a password64=YWI=").password.as_str(), "ab");
+        assert_eq!(save("save:a password64=Pz8-").password.as_str(), "??>");
+        assert_eq!(save("save:a password64=Pz8+").password.as_str(), "??>");
+        let s = save(&format!("save:acme.io password64={PW64}"));
+        assert_eq!(s.uri.as_deref(), Some("https://acme.io"));
+    }
+
+    #[test]
+    fn save_rejections() {
+        use ParseError::*;
+        let too_big = "QUFB".repeat(171); // 513 bytes
+        assert_eq!(too_big.len(), 684);
+        for (input, err) in [
+            ("save:x".to_string(), MissingPassword),
+            ("save:x password64=***".to_string(), BadPassword),
+            ("save:x password64=A".to_string(), BadPassword),
+            ("save:x password64=YQpi".to_string(), BadPassword), // "a\nb"
+            (format!("save:x password64={too_big}"), BadPassword),
+            ("save:x password64=".to_string(), BadPassword),
+            ("save:x password=x".to_string(), UnknownOption),
+            (
+                format!("save:x password64={PW64} password64={PW64}"),
+                DuplicateOption,
+            ),
+            (format!("save:x words=5 password64={PW64}"), UnknownOption),
+            (format!("save: password64={PW64}"), MissingName),
+        ] {
+            assert_eq!(parse(&input), Err(err), "{input}");
+        }
+    }
+
+    #[test]
+    fn redact_save() {
+        assert_eq!(
+            redact("save:Acme Corp user=a password64=SECRET | pi | r"),
+            "save:Acme Corp [redacted] | pi | r"
+        );
+        assert_eq!(redact("save:acme.io"), "save:acme.io");
+        assert_eq!(redact("save:password64=SECRET"), "save:[redacted]");
     }
 
     #[test]
