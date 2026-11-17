@@ -40,7 +40,10 @@ const DENY_QUIET: Duration = Duration::from_secs(60);
 /// After a cancelled unlock dialog, further unlock dialogs wait this long.
 const UNLOCK_QUIET: Duration = Duration::from_secs(120);
 const UNLOCK_DIALOG_TIMEOUT: Duration = Duration::from_secs(90);
-const RECENT: usize = 10;
+const RECENT: usize = 50;
+/// `why:` reports decisions this recent, at most [`WHY_MAX`] of them.
+const WHY_WINDOW_SECS: u64 = 900;
+const WHY_MAX: usize = 5;
 /// How long a code from `aac-touchid pair` can complete a pairing.
 const PAIR_WINDOW: Duration = Duration::from_secs(300);
 
@@ -339,6 +342,31 @@ pub fn pairing_reason(device: &str, issued_secs_ago: u64) -> String {
     )
 }
 
+/// What `why:` tells a device: its own recent decisions, newest first. Only
+/// request labels and outcomes, never vault contents.
+pub fn recent_for(recent: &VecDeque<Decision>, device: &str, now: u64) -> String {
+    let suffix = format!(" ({device})");
+    let lines: Vec<String> = recent
+        .iter()
+        .filter(|d| d.device == device || d.device.ends_with(&suffix))
+        .filter(|d| now.saturating_sub(d.at) <= WHY_WINDOW_SECS)
+        .take(WHY_MAX)
+        .map(|d| {
+            format!(
+                "{}: {}, {} ago",
+                d.query,
+                d.outcome,
+                ago(now.saturating_sub(d.at))
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        "no decisions for this device in the last 15 min".to_string()
+    } else {
+        lines.join("; ")
+    }
+}
+
 fn ago(secs: u64) -> String {
     if secs < 60 {
         format!("{secs} s")
@@ -611,6 +639,7 @@ impl Service {
                     Intent::Batch(b) => self.batch(p, b, reply).await,
                     Intent::Create(n) => self.create(p, n, reply).await,
                     Intent::AddTotp(t) => self.add_totp(p, t, reply).await,
+                    Intent::Why => self.why(p, reply),
                 }
             }
         }
@@ -974,6 +1003,25 @@ impl Service {
                 deny(reply);
             }
         }
+    }
+
+    /// Tell a device why its recent requests were refused. No sheet and no
+    /// unlock: only its own decision records leave, never vault data.
+    fn why(&self, p: Pending, reply: ReplyTx) {
+        let text = recent_for(&shared(&self.shared).recent, &p.device, now_secs());
+        info!("why: {} asked for its recent decisions", p.device);
+        release(
+            reply,
+            CredentialData {
+                username: None,
+                password: None,
+                totp: None,
+                uri: None,
+                notes: None,
+                credential_id: None,
+                domain: Some(text),
+            },
+        );
     }
 
     async fn add_totp(&mut self, p: Pending, t: AddTotp, reply: ReplyTx) {
@@ -1381,6 +1429,40 @@ mod tests {
                 bold("Acme")
             )
         );
+    }
+
+    #[test]
+    fn recent_for_filters_by_device_and_age() {
+        let d = |at: u64, device: &str, query: &str, outcome: &str| Decision {
+            at,
+            device: device.to_string(),
+            query: query.to_string(),
+            outcome: outcome.to_string(),
+        };
+        let now = 10_000;
+        let mut recent: VecDeque<Decision> = VecDeque::new();
+        // Newest first, like `Service::record`.
+        recent.push_back(d(now - 10, "mac-pro", "other", "approved"));
+        recent.push_back(d(
+            now - 40,
+            "nuc",
+            "new Speedtest",
+            "refused (already exists)",
+        ));
+        recent.push_back(d(now - 100, "pi (nuc)", "github.com", "approved"));
+        recent.push_back(d(now - 1000, "nuc", "old", "denied"));
+        assert_eq!(
+            recent_for(&recent, "nuc", now),
+            "new Speedtest: refused (already exists), 40 s ago; github.com: approved, 1 min ago"
+        );
+        assert_eq!(
+            recent_for(&recent, "laptop", now),
+            "no decisions for this device in the last 15 min"
+        );
+        for i in 0..8 {
+            recent.push_front(d(now - i, "nuc", &format!("q{i}"), "denied"));
+        }
+        assert_eq!(recent_for(&recent, "nuc", now).split("; ").count(), 5);
     }
 
     #[test]

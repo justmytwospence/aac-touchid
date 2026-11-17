@@ -9,6 +9,8 @@
 //! - `totp:<item> secret=<base32>` or `totp:<item> uri=otpauth://totp/...`
 //!   stores a 2FA seed on a login.
 //!
+//! - `why:` asks, without a sheet, why this device's recent requests were
+//!   refused.
 //! - `<item> remember=15m` is a read that also asks to release the same item
 //!   again for that long (1m-24h) without another sheet.
 //! - `batch:<a>,<b>,... [remember=15m]` approves several items on one sheet.
@@ -45,6 +47,8 @@ pub enum Intent {
     Batch(Batch),
     Create(NewLogin),
     AddTotp(AddTotp),
+    /// The device's own recent decisions, no sheet.
+    Why,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +184,12 @@ pub fn parse(what: &str) -> Result<Intent, ParseError> {
         parse_totp(rest).map(Intent::AddTotp)
     } else if let Some(rest) = strip_prefix_ci(s, "batch:") {
         parse_batch(rest).map(Intent::Batch)
+    } else if let Some(rest) = strip_prefix_ci(s, "why:") {
+        if rest.trim().is_empty() {
+            Ok(Intent::Why)
+        } else {
+            Err(ParseError::UnexpectedText)
+        }
     } else {
         parse_read(what).map(Intent::Read)
     }
@@ -556,6 +566,13 @@ mod tests {
             Ok(Intent::AddTotp(t)) => t,
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn why_parses() {
+        assert_eq!(parse("why:"), Ok(Intent::Why));
+        assert_eq!(parse(" WHY:  "), Ok(Intent::Why));
+        assert_eq!(parse("why: x"), Err(ParseError::UnexpectedText));
     }
 
     #[test]

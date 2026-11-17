@@ -247,7 +247,7 @@ async fn client(req: control::Request, json: bool) -> ExitCode {
         if s.recent.is_empty() {
             println!("  (none)");
         }
-        for r in &s.recent {
+        for r in s.recent.iter().take(10) {
             println!(
                 "  {:>9}  {}  {}  {}",
                 ago(r.at),

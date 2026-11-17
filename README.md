@@ -79,6 +79,16 @@ Guardrails:
 
 It replaces the interactive `aac listen` terminal app. There is nothing to keep open, and nothing an agent can type, click or send to a terminal pane can approve a request.
 
+## Why was I denied?
+
+A refusal reaches the agent only as `aac` exit 4. `why:` asks for the reason, with no sheet and no unlock:
+
+```sh
+aac connect --domain "why:" --output json
+```
+
+The reply's `domain` holds this device's last 5 decisions from the last 15 minutes, newest first, for example `new Speedtest Tracker: refused (already exists: a login for speedtest.example.com), 40 s ago`. It carries request labels and outcomes only, never vault item names or secrets.
+
 ## Fewer sheets: remember and batch
 
 Two more request forms ride in the item part of `--domain`, like `new:` and `totp:`:
@@ -175,6 +185,7 @@ Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents
 - After a denial, the same device asking for the same item is denied silently for 60 s, and a cancelled unlock dialog is not shown again for 2 minutes, so an agent cannot spam prompts.
 - The master password and vault key never go into an environment variable or a command line, where any process of the same user can read it (`ps -E`). The listener runs one `bw serve` child on a private socket pair (`--hostname fd+connected://3`, a supported `bw serve` mode) that no other process can open; the master password travels once in its `POST /unlock` body and the vault key stays inside that child. Locking calls `/lock` and stops the child.
 - `bw login --apikey` reads the API key only from its environment, so on first login the key is in that one short-lived child's environment. The API key alone cannot decrypt the vault.
+- `why:` releases only the asking device's own decision records (request labels and outcomes), without a sheet.
 - Only username, password, URI and the current 2FA code (never the TOTP seed) are released.
 - A `totp:` seed is in the requesting machine's `aac` command line while it runs, where processes of the same user there can read it, and the agent has seen it once on the signup page. It leaves the listener only inside the encrypted vault: logs and `status` show `totp:<item> [redacted]` and `2FA <item>`. Generated passwords and seeds are wiped from the listener's request buffers after use.
 - Agent names are reduced to letters, digits, spaces and `· . - _ / @`, so a name cannot fake a device suffix or extra lines. Pairing completes only within 5 minutes of `aac-touchid pair`, and the sheet names the device and when its code was issued.
