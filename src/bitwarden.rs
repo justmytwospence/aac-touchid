@@ -637,9 +637,15 @@ impl Vault {
         }
     }
 
-    /// Replace a login's password. Reads the item again first; the old
-    /// password is expected to move into the item's password history.
-    pub async fn set_password(&mut self, id: &str, new: &str) -> Result<PasswordWrite, String> {
+    /// Replace a login's password, and its username when one is given.
+    /// Reads the item again first; the old password is expected to move into
+    /// the item's password history.
+    pub async fn set_password(
+        &mut self,
+        id: &str,
+        new: &str,
+        username: Option<&str>,
+    ) -> Result<PasswordWrite, String> {
         let path = format!("/object/item/{}", pct(id));
         let mut reply = self.call("GET", &path, None).await?;
         let checked = self.check(&reply);
@@ -658,6 +664,9 @@ impl Vault {
             .filter(|p| !p.is_empty())
             .map(|p| Zeroizing::new(p.to_string()));
         item["login"]["password"] = Value::String(new.to_string());
+        if let Some(u) = username {
+            item["login"]["username"] = Value::String(u.to_string());
+        }
         let body = serde_json::to_vec(&item).map_err(|e| e.to_string());
         wipe(&mut item);
         let mut body = Zeroizing::new(body?);
@@ -665,7 +674,8 @@ impl Vault {
         body.zeroize();
         let mut reply = reply?;
         let checked = self.check(&reply);
-        let stored = reply["data"]["login"]["password"].as_str() == Some(new);
+        let stored = reply["data"]["login"]["password"].as_str() == Some(new)
+            && username.is_none_or(|u| reply["data"]["login"]["username"].as_str() == Some(u));
         let history_kept = old
             .as_deref()
             .is_none_or(|o| history_has(&reply["data"], o));
@@ -1367,7 +1377,7 @@ while True:
         assert!(matches!(v.resolve("hub.com").await, Resolved::NotFound));
         // Rotation keeps the old password in the item's history.
         assert_eq!(
-            v.set_password("i1", "newpw").await,
+            v.set_password("i1", "newpw", Some("bot@x.com")).await,
             Ok(PasswordWrite::Replaced { history_kept: true })
         );
         let Resolved::Item(github) = v.resolve("i1").await else {
@@ -1375,6 +1385,7 @@ while True:
         };
         assert_eq!(github["login"]["password"], "newpw");
         assert_eq!(github["passwordHistory"][0]["password"], "pw");
+        assert_eq!(github["login"]["username"], "bot@x.com");
         assert_eq!(github["login"]["totp"], "SEED", "PUT keeps the item");
 
         v.lock().await;

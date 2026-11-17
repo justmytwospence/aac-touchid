@@ -319,21 +319,24 @@ pub fn create_reason(
     )
 }
 
-/// `Bitwarden is trying to replace a password with a 6-word passphrase and share it`.
+/// `Bitwarden is trying to replace a password with a 6-word passphrase and share it`,
+/// or with `user=`: `..., set the username to bot@x.com, and share it`. The
+/// item line shows the username the login has now.
 pub fn rotate_reason(
     who: &str,
     item: &str,
     username: Option<&str>,
+    new_username: Option<&str>,
     secret: &str,
     why: Option<&str>,
 ) -> String {
-    sheet(
-        &format!("replace a password with a {secret} and share it"),
-        who,
-        item,
-        username,
-        why,
-    )
+    let action = match new_username {
+        Some(u) => {
+            format!("replace a password with a {secret}, set the username to {u}, and share it")
+        }
+        None => format!("replace a password with a {secret} and share it"),
+    };
+    sheet(&action, who, item, username, why)
 }
 
 /// `Bitwarden is trying to save a password the agent supplied`.
@@ -1166,7 +1169,12 @@ impl Service {
         };
         let id = item["id"].as_str().map(String::from);
         let name = item["name"].as_str().map(String::from);
-        let username = item["login"]["username"].as_str().map(String::from);
+        let username = item["login"]["username"]
+            .as_str()
+            .filter(|u| !u.is_empty())
+            .map(String::from);
+        // Setting the username it already has is no change.
+        let new_username = r.username.clone().filter(|u| Some(u) != username.as_ref());
         let uri = item["login"]["uris"][0]["uri"].as_str().map(String::from);
         let is_login = item["type"].as_i64() == Some(1) && item["login"].is_object();
         wipe(&mut item);
@@ -1184,6 +1192,7 @@ impl Service {
             &p.who,
             &shown,
             username.as_deref(),
+            new_username.as_deref(),
             &r.secret.describe(),
             p.why.as_deref(),
         );
@@ -1192,13 +1201,17 @@ impl Service {
         }
         let written = async {
             let password = self.vault.generate(r.secret).await?;
-            let write = self.vault.set_password(&id, &password).await?;
+            let write = self
+                .vault
+                .set_password(&id, &password, new_username.as_deref())
+                .await?;
             Ok::<_, String>((password, write))
         }
         .await;
         match written {
             Ok((password, PasswordWrite::Replaced { history_kept })) => {
                 self.after_write().await;
+                let username = new_username.or(username);
                 if history_kept {
                     self.record(&p.recipient(), &what, "rotated");
                 } else {
@@ -1615,12 +1628,27 @@ mod tests {
                 &who,
                 "Acme",
                 Some("bot"),
+                None,
                 "6-word passphrase",
                 Some("rotate")
             ),
             format!(
                 "replace a password with a 6-word passphrase and share it\n\n{who}\n{} (bot)\nrotate",
                 bold("Acme")
+            )
+        );
+        assert_eq!(
+            rotate_reason(
+                &who,
+                "Speedtest",
+                None,
+                Some("st@x.com"),
+                "6-word passphrase",
+                None
+            ),
+            format!(
+                "replace a password with a 6-word passphrase, set the username to st@x.com, and share it\n\n{who}\n{}\nno reason given",
+                bold("Speedtest")
             )
         );
         assert_eq!(

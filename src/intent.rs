@@ -8,8 +8,9 @@
 //!   `[length=12-128] [symbols=no]` a random password.
 //! - `save:<name> [user=<u>] [url=<full url>] password64=<base64>` stores a
 //!   password the agent already has as a new login.
-//! - `rotate:<item> [words=3-20] [length=12-128] [symbols=no]` replaces the
-//!   password of an existing login with a generated one.
+//! - `rotate:<item> [user=<u>] [words=3-20] [length=12-128] [symbols=no]`
+//!   replaces the password of an existing login with a generated one, and
+//!   with `user=` sets its username too.
 //! - `totp:<item> secret=<base32>` or `totp:<item> uri=otpauth://totp/...`
 //!   stores a 2FA seed on a login.
 //!
@@ -109,6 +110,8 @@ impl Generator {
 pub struct Rotate {
     /// A host, URL, item name or item id, resolved like a read.
     pub item: String,
+    /// A username to set on the login in the same write.
+    pub username: Option<String>,
     pub secret: Generator,
 }
 
@@ -600,14 +603,22 @@ fn parse_rotate(rest: &str) -> Result<Rotate, ParseError> {
     if item.len() > MAX_ITEM || item.chars().any(char::is_control) {
         return Err(ParseError::BadItem);
     }
+    let mut username = None;
     let mut generator = GenOptions::default();
     for (key, value) in options {
-        if !generator.take(key, value)? {
+        if generator.take(key, value)? {
+            continue;
+        }
+        if !key.eq_ignore_ascii_case("user") {
             return Err(ParseError::UnknownOption);
+        }
+        if username.replace(parse_user(value)?).is_some() {
+            return Err(ParseError::DuplicateOption);
         }
     }
     Ok(Rotate {
         item: item.to_string(),
+        username,
         secret: generator.finish()?,
     })
 }
@@ -773,6 +784,10 @@ mod tests {
             }
         );
         assert_eq!(rotate("ROTATE:x").item, "x");
+        assert_eq!(rotate("rotate:x").username, None);
+        let r = rotate("rotate:x user=speedtest@example.com words=4");
+        assert_eq!(r.username.as_deref(), Some("speedtest@example.com"));
+        assert_eq!(r.secret, Generator::Passphrase { words: 4 });
     }
 
     #[test]
@@ -782,7 +797,9 @@ mod tests {
             ("rotate:", MissingItem),
             ("rotate:a b", BadItem),
             ("rotate:x password64=YQ", UnknownOption),
-            ("rotate:x user=me", UnknownOption),
+            ("rotate:x url=https://x.com", UnknownOption),
+            ("rotate:x user=", BadUser),
+            ("rotate:x user=a user=b", DuplicateOption),
             ("rotate:x words=5 length=20", MixedGenerators),
             ("rotate:x words=4 words=5", DuplicateOption),
             ("rotate:x length=5", BadLength),
