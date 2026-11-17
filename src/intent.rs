@@ -16,6 +16,9 @@
 //!
 //! - `why:` asks, without a sheet, why this device's recent requests were
 //!   refused.
+//! - `savefield:<item> name=<NAME> value64=<base64> [user=<u>] [url=<full url>]`
+//!   stores an API key the agent already has as a hidden custom field of an
+//!   item, or of a new login when there is no such item.
 //! - `<item> remember=15m` is a read that also asks to release the same item
 //!   again for that long (1m-24h) without another sheet.
 //! - `<item> field=<NAME>` reads one custom field of an item (its value
@@ -42,6 +45,8 @@ pub const DEFAULT_WORDS: u32 = 6;
 pub const MAX_BATCH: usize = 10;
 const MAX_NAME: usize = 64;
 const MAX_FIELD: usize = 64;
+const MAX_FIELD_VALUE: usize = 4096;
+const MAX_FIELD_B64: usize = 5464;
 const MAX_ITEM: usize = 128;
 const MAX_USER: usize = 128;
 const MAX_URL: usize = 2048;
@@ -60,6 +65,7 @@ pub enum Intent {
     AddTotp(AddTotp),
     Rotate(Rotate),
     Save(SaveLogin),
+    SaveField(SaveField),
     /// The device's own recent decisions, no sheet.
     Why,
 }
@@ -158,6 +164,31 @@ impl fmt::Debug for SaveLogin {
     }
 }
 
+/// An API key the agent already has, to be stored as a hidden custom field.
+#[derive(PartialEq, Eq)]
+pub struct SaveField {
+    /// One word: a host, an item name without spaces, or an item id.
+    pub item: String,
+    pub name: String,
+    pub value: Zeroizing<String>,
+    /// For a new login only.
+    pub username: Option<String>,
+    /// For a new login only.
+    pub uri: Option<String>,
+}
+
+impl fmt::Debug for SaveField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SaveField")
+            .field("item", &self.item)
+            .field("name", &self.name)
+            .field("value", &"[redacted]")
+            .field("username", &self.username)
+            .field("uri", &self.uri)
+            .finish()
+    }
+}
+
 #[derive(PartialEq, Eq)]
 pub struct AddTotp {
     /// One word: a domain, an item name without spaces, or an item id.
@@ -202,6 +233,9 @@ pub enum ParseError {
     EmptyItem,
     BadRemember,
     BadField,
+    MissingFieldName,
+    MissingValue,
+    BadValue,
     EmptyBatch,
     TooManyItems,
     DuplicateItem,
@@ -213,7 +247,7 @@ impl fmt::Display for ParseError {
         f.write_str(match self {
             Self::MissingName => "new: needs a name",
             Self::BadName => "name must be 1-64 letters, digits, spaces or . - _ @ & + '",
-            Self::MissingItem => "totp: and rotate: need an item",
+            Self::MissingItem => "totp:, rotate: and savefield: need an item",
             Self::BadItem => "item must be one word of at most 128 characters",
             Self::UnexpectedText => "unexpected text after the options",
             Self::UnknownOption => "unknown option",
@@ -237,6 +271,11 @@ impl fmt::Display for ParseError {
             Self::EmptyItem => "request names no item",
             Self::BadRemember => "remember must be 1m-24h, like 15m or 2h",
             Self::BadField => "field must be 1-64 letters, digits or _ . -",
+            Self::MissingFieldName => "savefield: needs name=",
+            Self::MissingValue => "savefield: needs value64=",
+            Self::BadValue => {
+                "value64 must be base64 of 1-4096 bytes of text without control characters"
+            }
             Self::EmptyBatch => "batch: needs items",
             Self::TooManyItems => "batch: at most 10 items",
             Self::DuplicateItem => "item listed twice",
@@ -251,6 +290,8 @@ pub fn parse(what: &str) -> Result<Intent, ParseError> {
         parse_new(rest).map(Intent::Create)
     } else if let Some(rest) = strip_prefix_ci(s, "save:") {
         parse_save(rest).map(Intent::Save)
+    } else if let Some(rest) = strip_prefix_ci(s, "savefield:") {
+        parse_savefield(rest).map(Intent::SaveField)
     } else if let Some(rest) = strip_prefix_ci(s, "totp:") {
         parse_totp(rest).map(Intent::AddTotp)
     } else if let Some(rest) = strip_prefix_ci(s, "rotate:") {
@@ -433,13 +474,15 @@ pub fn redact(raw: &str) -> String {
     let s = &raw[lead..];
     let (prefix, many) = if strip_prefix_ci(s, "totp:").is_some() {
         (&s[..5], false)
+    } else if strip_prefix_ci(s, "savefield:").is_some() {
+        (&s[..10], false)
     } else if strip_prefix_ci(s, "save:").is_some() {
         // A name may have spaces; everything from the first option on goes.
         (&s[..5], true)
     } else {
         return raw.to_string();
     };
-    let rest = &s[5..];
+    let rest = &s[prefix.len()..];
     let (head, tail) = rest.find('|').map_or((rest, ""), |i| rest.split_at(i));
     let words: Vec<&str> = head.split_whitespace().collect();
     let kept: Vec<&str> = words
@@ -638,6 +681,78 @@ fn parse_save(rest: &str) -> Result<SaveLogin, ParseError> {
         uri,
         password: password.ok_or(ParseError::MissingPassword)?,
     })
+}
+
+fn parse_savefield(rest: &str) -> Result<SaveField, ParseError> {
+    let (words, options) = split_words(rest)?;
+    let item = match words.as_slice() {
+        [] => return Err(ParseError::MissingItem),
+        [item] => *item,
+        _ => return Err(ParseError::BadItem),
+    };
+    if item.len() > MAX_ITEM || item.chars().any(char::is_control) {
+        return Err(ParseError::BadItem);
+    }
+    let mut name = None;
+    let mut value: Option<Zeroizing<String>> = None;
+    let mut username = None;
+    let mut url = None;
+    for (key, v) in options {
+        let slot_taken = match key.to_ascii_lowercase().as_str() {
+            "name" => name.replace(parse_field(v)?).is_some(),
+            "value64" => value.replace(parse_value64(v)?).is_some(),
+            "user" => username.replace(parse_user(v)?).is_some(),
+            "url" => url.replace(parse_url(v)?).is_some(),
+            _ => return Err(ParseError::UnknownOption),
+        };
+        if slot_taken {
+            return Err(ParseError::DuplicateOption);
+        }
+    }
+    Ok(SaveField {
+        item: item.to_string(),
+        name: name.ok_or(ParseError::MissingFieldName)?,
+        value: value.ok_or(ParseError::MissingValue)?,
+        username,
+        uri: url,
+    })
+}
+
+fn parse_value64(value: &str) -> Result<Zeroizing<String>, ParseError> {
+    if value.len() > MAX_FIELD_B64 {
+        return Err(ParseError::BadValue);
+    }
+    let bytes = decode_base64(value).ok_or(ParseError::BadValue)?;
+    let text = String::from_utf8(bytes.to_vec())
+        .map(Zeroizing::new)
+        .map_err(|_| ParseError::BadValue)?;
+    if text.is_empty() || text.len() > MAX_FIELD_VALUE || text.chars().any(char::is_control) {
+        return Err(ParseError::BadValue);
+    }
+    Ok(text)
+}
+
+/// The name a login created for a `savefield:` item gets, if the item can
+/// become one: a valid `new:` name that is not an item id.
+pub fn new_login_name(item: &str) -> Option<String> {
+    if looks_like_item_id(item) {
+        return None;
+    }
+    parse_name(&[item]).ok()
+}
+
+/// `https://<item>` when the item looks like a host.
+pub fn new_login_uri(item: &str) -> Option<String> {
+    default_uri(item)
+}
+
+/// `8-4-4-4-12` hex digits: a Bitwarden item id.
+fn looks_like_item_id(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 fn parse_password64(value: &str) -> Result<Zeroizing<String>, ParseError> {
@@ -961,6 +1076,125 @@ mod tests {
         assert_eq!(redact("save:password64=SECRET"), "save:[redacted]");
     }
 
+    fn b64(s: &str) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in s.as_bytes().chunks(3) {
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    fn savefield(s: &str) -> SaveField {
+        match parse(s) {
+            Ok(Intent::SaveField(f)) => f,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn savefield_parses() {
+        let f = savefield(&format!(
+            "savefield:openai.com name=API_KEY value64={}",
+            b64("sk-1")
+        ));
+        assert_eq!(f.item, "openai.com");
+        assert_eq!(f.name, "API_KEY");
+        assert_eq!(f.value.as_str(), "sk-1");
+        assert_eq!((f.username, f.uri), (None, None));
+        let f = savefield(&format!(
+            "SAVEFIELD:x NAME=k VALUE64={} USER=bot URL=https://platform.openai.com",
+            b64("v")
+        ));
+        assert_eq!(f.username.as_deref(), Some("bot"));
+        assert_eq!(f.uri.as_deref(), Some("https://platform.openai.com"));
+    }
+
+    #[test]
+    fn savefield_rejections() {
+        let v = b64("sk-1");
+        let p = |s: String| parse(&s).map(|_| ());
+        assert_eq!(
+            p(format!("savefield: name=K value64={v}")),
+            Err(ParseError::MissingItem)
+        );
+        assert_eq!(
+            p(format!("savefield:a b name=K value64={v}")),
+            Err(ParseError::BadItem)
+        );
+        assert_eq!(
+            p(format!("savefield:a value64={v}")),
+            Err(ParseError::MissingFieldName)
+        );
+        assert_eq!(
+            p("savefield:a name=K".into()),
+            Err(ParseError::MissingValue)
+        );
+        for bad in [
+            "!!!".to_string(),
+            b64("a\nb"),
+            String::new(),
+            b64(&"x".repeat(4097)),
+        ] {
+            assert_eq!(
+                p(format!("savefield:a name=K value64={bad}")),
+                Err(ParseError::BadValue),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            p(format!(
+                "savefield:a name=K value64={}",
+                b64(&"x".repeat(4096))
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            p(format!("savefield:a name=a/b value64={v}")),
+            Err(ParseError::BadField)
+        );
+        assert_eq!(
+            p(format!("savefield:a name=K value64={v} foo=1")),
+            Err(ParseError::UnknownOption)
+        );
+        assert_eq!(
+            p(format!("savefield:a name=K name=L value64={v}")),
+            Err(ParseError::DuplicateOption)
+        );
+    }
+
+    #[test]
+    fn savefield_redaction_and_debug() {
+        assert_eq!(
+            redact("savefield:openai.com name=K value64=c2stMQ | pi | x"),
+            "savefield:openai.com [redacted] | pi | x"
+        );
+        let f = savefield("savefield:a name=K value64=c2stMQ");
+        assert!(!format!("{f:?}").contains("sk-1"));
+        assert!(!format!("{f:?}").contains("c2stMQ"));
+    }
+
+    #[test]
+    fn new_login_names() {
+        assert_eq!(new_login_name("openai.com").as_deref(), Some("openai.com"));
+        assert_eq!(new_login_name("2b5c1f4e-0a2d-4b7e-9f3a-1c2d3e4f5a6b"), None);
+        assert_eq!(new_login_name("a/b"), None);
+        assert_eq!(
+            new_login_uri("openai.com").as_deref(),
+            Some("https://openai.com")
+        );
+        assert_eq!(new_login_uri("OpenAI"), None);
+    }
+
     #[test]
     fn why_parses() {
         assert_eq!(parse("why:"), Ok(Intent::Why));
@@ -1190,6 +1424,8 @@ mod tests {
             format!("new:x {secretish}=y"),
             format!("totp:x secret={secretish}9"),
             format!("x field={secretish}/"),
+            format!("savefield:x name={secretish}/ value64=c2stMQ"),
+            format!("savefield:x name=K value64={secretish}!!"),
         ] {
             let e = parse(&s).expect_err(&s).to_string();
             assert!(!e.contains(secretish), "{e}");

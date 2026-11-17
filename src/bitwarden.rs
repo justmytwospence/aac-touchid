@@ -87,7 +87,10 @@ pub const AGENT_FOLDER: &str = "Agent-created";
 pub struct NewLogin<'a> {
     pub name: &'a str,
     pub username: Option<&'a str>,
-    pub password: &'a str,
+    /// `None` makes a login that holds only a custom field.
+    pub password: Option<&'a str>,
+    /// A hidden custom field to create the login with: its name and value.
+    pub field: Option<(&'a str, &'a str)>,
     pub uri: Option<&'a str>,
     pub folder_id: &'a str,
     pub notes: &'a str,
@@ -118,6 +121,38 @@ pub enum TotpWrite {
     /// The login has a seed already; it is never overwritten.
     AlreadySet,
     NotLogin,
+}
+
+/// What writing a custom field did to an item.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FieldWrite {
+    /// A new hidden field, or an empty one filled in.
+    Added,
+    /// The field already held this value; nothing is written.
+    Unchanged,
+    /// The old value now sits in the field named `archived`, and the new one
+    /// in a hidden field under the old name.
+    Replaced { archived: String },
+    /// Several fields have that name; nothing is written.
+    Ambiguous(usize),
+    /// A linked field has no value of its own; nothing is written.
+    Linked,
+}
+
+/// What an item's fields say about a `savefield:` before it is written.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FieldState {
+    Absent,
+    /// A field of that name with no value.
+    Empty,
+    /// The field already holds the value.
+    Same,
+    /// A field of that name with another value; `vault_name` is its name.
+    Present {
+        vault_name: String,
+    },
+    Ambiguous(usize),
+    Linked,
 }
 
 #[derive(Deserialize)]
@@ -604,6 +639,11 @@ impl Vault {
             .map(|u| serde_json::json!({ "match": null, "uri": u }))
             .into_iter()
             .collect();
+        let fields: Vec<Value> = new
+            .field
+            .map(|(n, v)| serde_json::json!({ "name": n, "value": v, "type": 1, "linkedId": null }))
+            .into_iter()
+            .collect();
         let mut item = serde_json::json!({
             "organizationId": null,
             "collectionIds": null,
@@ -612,7 +652,7 @@ impl Vault {
             "name": new.name,
             "notes": new.notes,
             "favorite": false,
-            "fields": [],
+            "fields": fields,
             "reprompt": 0,
             "login": {
                 "uris": uris,
@@ -728,6 +768,61 @@ impl Vault {
         }
     }
 
+    /// Store a hidden custom field on an item, keeping any value it replaces:
+    /// the old field is renamed `<name> (replaced <date>)` and stays on the
+    /// item. Reads the item again first, so what is archived is what is there
+    /// now, and checks the reply holds everything before it reports success.
+    pub async fn set_field(
+        &mut self,
+        id: &str,
+        name: &str,
+        value: &str,
+        date: &str,
+    ) -> Result<FieldWrite, String> {
+        let path = format!("/object/item/{}", pct(id));
+        let mut reply = self.call("GET", &path, None).await?;
+        let checked = self.check(&reply);
+        let mut item = reply["data"].take();
+        wipe(&mut reply);
+        if let Err(e) = checked {
+            wipe(&mut item);
+            return Err(e);
+        }
+        let old = match field_hits(&item, name).as_slice() {
+            [i] => item["fields"][*i]["value"]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .map(|v| Zeroizing::new(v.to_string())),
+            _ => None,
+        };
+        let write = put_field(&mut item, name, value, date);
+        if !matches!(write, FieldWrite::Added | FieldWrite::Replaced { .. }) {
+            wipe(&mut item);
+            return Ok(write);
+        }
+        let body = serde_json::to_vec(&item).map_err(|e| e.to_string());
+        wipe(&mut item);
+        let mut body = Zeroizing::new(body?);
+        let reply = self.call("PUT", &path, Some(&body)).await;
+        body.zeroize();
+        let mut reply = reply?;
+        let checked = self.check(&reply);
+        let stored = field_stored(&reply["data"], name, value)
+            && match &write {
+                FieldWrite::Replaced { archived } => {
+                    field_named(&reply["data"], archived) == old.as_deref().map(String::as_str)
+                }
+                _ => true,
+            };
+        wipe(&mut reply);
+        checked?;
+        if stored {
+            Ok(write)
+        } else {
+            Err("bw did not store the field".to_string())
+        }
+    }
+
     /// The current TOTP code of an item, never its seed.
     pub async fn totp_code(&mut self, id: &str) -> Option<String> {
         self.call("GET", &format!("/object/totp/{}", pct(id)), None)
@@ -770,6 +865,124 @@ impl Vault {
             fields,
         )
     }
+}
+
+/// Indices of the item's fields a request's name matches, of any type.
+fn field_hits(item: &Value, name: &str) -> Vec<usize> {
+    item["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, f)| {
+            f["name"]
+                .as_str()
+                .is_some_and(|n| crate::intent::field_matches(n, name))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// What the item's fields say about storing `value` under `name`.
+pub fn field_state(item: &Value, name: &str, value: &str) -> FieldState {
+    let hits = field_hits(item, name);
+    match hits.as_slice() {
+        [] => FieldState::Absent,
+        [i] => {
+            let f = &item["fields"][*i];
+            let current = f["value"].as_str().unwrap_or_default();
+            if f["type"].as_u64() == Some(3) {
+                FieldState::Linked
+            } else if current == value {
+                FieldState::Same
+            } else if current.is_empty() {
+                FieldState::Empty
+            } else {
+                FieldState::Present {
+                    vault_name: f["name"].as_str().unwrap_or(name).to_string(),
+                }
+            }
+        }
+        more => FieldState::Ambiguous(more.len()),
+    }
+}
+
+/// Store `value` as a hidden field named `name` on the item, in place. An
+/// existing value is never dropped: its field is renamed
+/// `<vault name> (replaced <date>)` (with ` #2`, ` #3`... if that is taken)
+/// and the new value goes in a new hidden field under the old name.
+pub fn put_field(item: &mut Value, name: &str, value: &str, date: &str) -> FieldWrite {
+    let hits = field_hits(item, name);
+    if hits.len() > 1 {
+        return FieldWrite::Ambiguous(hits.len());
+    }
+    if !item["fields"].is_array() {
+        item["fields"] = serde_json::json!([]);
+    }
+    let Some(fields) = item["fields"].as_array_mut() else {
+        return FieldWrite::Ambiguous(0);
+    };
+    let fresh =
+        |n: &str| serde_json::json!({ "name": n, "value": value, "type": 1, "linkedId": null });
+    let Some(&i) = hits.first() else {
+        fields.push(fresh(name));
+        return FieldWrite::Added;
+    };
+    if fields[i]["type"].as_u64() == Some(3) {
+        return FieldWrite::Linked;
+    }
+    let current = fields[i]["value"].as_str().unwrap_or_default();
+    if current == value {
+        return FieldWrite::Unchanged;
+    }
+    if current.is_empty() {
+        fields[i]["value"] = Value::String(value.to_string());
+        return FieldWrite::Added;
+    }
+    let vault_name = fields[i]["name"].as_str().unwrap_or(name).to_string();
+    let base = format!("{vault_name} (replaced {date})");
+    let taken = |n: &str| fields.iter().any(|f| f["name"].as_str() == Some(n));
+    let mut archived = base.clone();
+    let mut k = 2;
+    while taken(&archived) {
+        archived = format!("{base} #{k}");
+        k += 1;
+    }
+    fields[i]["name"] = Value::String(archived.clone());
+    fields.push(fresh(&vault_name));
+    FieldWrite::Replaced { archived }
+}
+
+/// The value of the field named exactly `name`, if any.
+fn field_named<'a>(item: &'a Value, name: &str) -> Option<&'a str> {
+    item["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|f| f["name"].as_str() == Some(name))
+        .and_then(|f| f["value"].as_str())
+}
+
+/// Whether exactly one field matches `name` and it holds `value`.
+fn field_stored(item: &Value, name: &str, value: &str) -> bool {
+    match field_hits(item, name).as_slice() {
+        [i] => item["fields"][*i]["value"].as_str() == Some(value),
+        _ => false,
+    }
+}
+
+/// `YYYY-MM-DD` (UTC) for a Unix time.
+pub fn utc_date(secs: u64) -> String {
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Which of an item's custom fields a request names: text, hidden or boolean
@@ -1256,6 +1469,163 @@ mod tests {
         }
     }
 
+    fn with_fields(fields: Value) -> Value {
+        serde_json::json!({ "name": "OpenAI", "fields": fields })
+    }
+
+    fn f(name: &str, value: Option<&str>, kind: u8) -> Value {
+        serde_json::json!({ "name": name, "value": value, "type": kind, "linkedId": null })
+    }
+
+    /// Every value that was on the item is still on it afterwards.
+    fn keeps_every_value(before: &Value, after: &Value) {
+        for old in before["fields"].as_array().into_iter().flatten() {
+            let Some(v) = old["value"].as_str().filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            assert!(
+                after["fields"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|n| n["value"].as_str() == Some(v)),
+                "lost {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn put_field_cases() {
+        let date = "2026-11-17";
+        // A new hidden field, even when the item has no fields list.
+        let mut item = serde_json::json!({ "name": "OpenAI", "fields": null });
+        assert_eq!(
+            put_field(&mut item, "API_KEY", "new", date),
+            FieldWrite::Added
+        );
+        assert_eq!(
+            item["fields"],
+            serde_json::json!([f("API_KEY", Some("new"), 1)])
+        );
+
+        // An empty one is filled in place.
+        let mut item = with_fields(serde_json::json!([f("API Key", Some(""), 0)]));
+        assert_eq!(
+            put_field(&mut item, "api_key", "new", date),
+            FieldWrite::Added
+        );
+        assert_eq!(
+            item["fields"],
+            serde_json::json!([f("API Key", Some("new"), 0)])
+        );
+
+        // The same value is not written.
+        let mut item = with_fields(serde_json::json!([f("API Key", Some("new"), 1)]));
+        let before = item.clone();
+        assert_eq!(
+            put_field(&mut item, "API_KEY", "new", date),
+            FieldWrite::Unchanged
+        );
+        assert_eq!(item, before);
+
+        // A different value: the old one is kept under a dated name.
+        let mut item = with_fields(serde_json::json!([
+            f("Other", Some("o"), 1),
+            f("API Key", Some("old"), 0)
+        ]));
+        let before = item.clone();
+        assert_eq!(
+            put_field(&mut item, "API_KEY", "new", date),
+            FieldWrite::Replaced {
+                archived: "API Key (replaced 2026-11-17)".into()
+            }
+        );
+        assert_eq!(
+            item["fields"],
+            serde_json::json!([
+                f("Other", Some("o"), 1),
+                f("API Key (replaced 2026-11-17)", Some("old"), 0),
+                f("API Key", Some("new"), 1)
+            ])
+        );
+        keeps_every_value(&before, &item);
+
+        // The archive name is never reused.
+        let mut item = with_fields(serde_json::json!([
+            f("API Key", Some("old"), 1),
+            f("API Key (replaced 2026-11-17)", Some("older"), 1),
+            f("API Key (replaced 2026-11-17) #2", Some("oldest"), 1)
+        ]));
+        let before = item.clone();
+        assert_eq!(
+            put_field(&mut item, "API_KEY", "new", date),
+            FieldWrite::Replaced {
+                archived: "API Key (replaced 2026-11-17) #3".into()
+            }
+        );
+        keeps_every_value(&before, &item);
+        assert_eq!(item["fields"].as_array().map(Vec::len), Some(4));
+
+        // Refusals write nothing.
+        let mut item = with_fields(serde_json::json!([
+            f("k", Some("a"), 1),
+            f("K", Some("b"), 1)
+        ]));
+        let before = item.clone();
+        assert_eq!(
+            put_field(&mut item, "K", "new", date),
+            FieldWrite::Ambiguous(2)
+        );
+        assert_eq!(item, before);
+        let mut item = with_fields(serde_json::json!([f("K", None, 3)]));
+        let before = item.clone();
+        assert_eq!(put_field(&mut item, "K", "new", date), FieldWrite::Linked);
+        assert_eq!(item, before);
+    }
+
+    #[test]
+    fn field_states() {
+        let st = |fields: Value, v: &str| field_state(&with_fields(fields), "API_KEY", v);
+        assert_eq!(st(serde_json::json!([]), "v"), FieldState::Absent);
+        assert_eq!(
+            st(serde_json::json!([f("API Key", Some(""), 1)]), "v"),
+            FieldState::Empty
+        );
+        assert_eq!(
+            st(serde_json::json!([f("API Key", Some("v"), 1)]), "v"),
+            FieldState::Same
+        );
+        assert_eq!(
+            st(serde_json::json!([f("API Key", Some("x"), 1)]), "v"),
+            FieldState::Present {
+                vault_name: "API Key".into()
+            }
+        );
+        assert_eq!(
+            st(
+                serde_json::json!([f("API_KEY", Some("a"), 1), f("api_key", Some("b"), 1)]),
+                "v"
+            ),
+            FieldState::Ambiguous(2)
+        );
+        assert_eq!(
+            st(serde_json::json!([f("API_KEY", None, 3)]), "v"),
+            FieldState::Linked
+        );
+        assert_eq!(
+            field_state(&serde_json::json!({ "fields": null }), "K", "v"),
+            FieldState::Absent
+        );
+    }
+
+    #[test]
+    fn utc_dates() {
+        assert_eq!(utc_date(0), "1970-01-01");
+        assert_eq!(utc_date(951_782_400), "2000-02-29");
+        assert_eq!(utc_date(1_704_067_200), "2024-01-01");
+        assert_eq!(utc_date(1_794_891_543), "2026-11-17");
+    }
+
     #[test]
     fn field_picks() {
         let fields = [
@@ -1377,7 +1747,7 @@ while True:
         item = json.loads(body)
         key = route.rsplit("/", 1)[1]
         old = items.get(key)
-        if old and old["login"]["password"] != item["login"]["password"]:
+        if old and old.get("login") and item.get("login") and old["login"]["password"] != item["login"]["password"]:
             item["passwordHistory"] = [{"password": old["login"]["password"]}] + (old.get("passwordHistory") or [])
         items[key] = item
         out = {"success": True, "data": item}
@@ -1521,7 +1891,8 @@ while True:
             .create_login(&NewLogin {
                 name: "Acme",
                 username: Some("bot@x.com"),
-                password: &pw,
+                password: Some(&pw),
+                field: None,
                 uri: Some("https://acme.io"),
                 folder_id: "f1",
                 notes: "Created by aac-touchid",
@@ -1581,6 +1952,53 @@ while True:
         assert_eq!(github["passwordHistory"][0]["password"], "pw");
         assert_eq!(github["login"]["username"], "bot@x.com");
         assert_eq!(github["login"]["totp"], "SEED", "PUT keeps the item");
+
+        // Saving a field never drops the value it replaces.
+        assert_eq!(
+            v.set_field("i1", "API_KEY", "sk-3", "2026-11-17").await,
+            Ok(FieldWrite::Replaced {
+                archived: "API Key (replaced 2026-11-17)".into()
+            })
+        );
+        let Resolved::Item(github) = v.resolve("i1").await else {
+            panic!("github gone")
+        };
+        assert_eq!(field_named(&github, "API Key"), Some("sk-3"));
+        assert_eq!(
+            field_named(&github, "API Key (replaced 2026-11-17)"),
+            Some("sk-1")
+        );
+        assert_eq!(github["login"]["password"], "newpw", "PUT keeps the item");
+        assert_eq!(
+            v.set_field("i1", "API_KEY", "sk-3", "2026-11-17").await,
+            Ok(FieldWrite::Unchanged)
+        );
+        assert_eq!(
+            v.set_field("i1", "Link", "x", "2026-11-17").await,
+            Ok(FieldWrite::Linked)
+        );
+        assert_eq!(
+            v.set_field("n9", "OTHER", "v", "2026-11-17").await,
+            Ok(FieldWrite::Added)
+        );
+        let id = v
+            .create_login(&NewLogin {
+                name: "Acme API",
+                username: None,
+                password: None,
+                field: Some(("API_KEY", "sk-4")),
+                uri: Some("https://acme-api.io"),
+                folder_id: "f1",
+                notes: "x",
+            })
+            .await
+            .expect("create");
+        assert_eq!(id, "n2");
+        let Resolved::Item(acme) = v.resolve(&id).await else {
+            panic!("acme api not found")
+        };
+        assert_eq!(field_named(&acme, "API_KEY"), Some("sk-4"));
+        assert!(acme["login"]["password"].is_null());
 
         v.lock().await;
         assert!(!v.is_unlocked());

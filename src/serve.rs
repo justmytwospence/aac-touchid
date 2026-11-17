@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::bitwarden::{
-    self, Conflict, Lookup, PasswordWrite, Resolved, TotpWrite, Vault, host_of, wipe,
+    self, Conflict, FieldWrite, Lookup, PasswordWrite, Resolved, TotpWrite, Vault, host_of, wipe,
 };
 use crate::control::{self, Decision, Envelope, Request, Response, Status};
 use crate::dialog;
@@ -350,6 +350,39 @@ pub fn save_reason(who: &str, name: &str, username: Option<&str>, why: Option<&s
     )
 }
 
+/// What a `savefield:` is about to do, for its sheet.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FieldChange {
+    /// A new hidden field on an existing item.
+    Add,
+    /// A new value; the old one stays on the item as `archived`.
+    Replace { archived: String },
+    /// A new login that holds the field.
+    Create,
+}
+
+/// `Bitwarden is trying to save the field “API_KEY” the agent supplied`, or
+/// to replace it (keeping the old value), or to create a login for it.
+pub fn save_field_reason(
+    who: &str,
+    item: &str,
+    username: Option<&str>,
+    field: &str,
+    change: &FieldChange,
+    why: Option<&str>,
+) -> String {
+    let action = match change {
+        FieldChange::Add => format!("save the field \u{201c}{field}\u{201d} the agent supplied"),
+        FieldChange::Replace { archived } => format!(
+            "replace the field \u{201c}{field}\u{201d} with a value the agent supplied, keeping the old one as \u{201c}{archived}\u{201d}"
+        ),
+        FieldChange::Create => {
+            format!("create a login and save the field \u{201c}{field}\u{201d} the agent supplied")
+        }
+    };
+    sheet(&action, who, item, username, why)
+}
+
 /// `Bitwarden is trying to add 2FA and share a 2FA code`.
 pub fn totp_reason(who: &str, item: &str, username: Option<&str>, why: Option<&str>) -> String {
     sheet("add 2FA and share a 2FA code", who, item, username, why)
@@ -673,6 +706,7 @@ impl Service {
                     Intent::Create(n) => self.create(p, n, reply).await,
                     Intent::AddTotp(t) => self.add_totp(p, t, reply).await,
                     Intent::Save(n) => self.save(p, n, reply).await,
+                    Intent::SaveField(f) => self.save_field(p, f, reply).await,
                     Intent::Rotate(r) => self.rotate(p, r, reply).await,
                     Intent::Why => self.why(p, reply),
                 }
@@ -1050,7 +1084,8 @@ impl Service {
                 .create_login(&bitwarden::NewLogin {
                     name: &n.name,
                     username: n.username.as_deref(),
-                    password: &password,
+                    password: Some(&password),
+                    field: None,
                     uri: n.uri.as_deref(),
                     folder_id: &folder,
                     notes: &notes,
@@ -1134,7 +1169,8 @@ impl Service {
                 .create_login(&bitwarden::NewLogin {
                     name: &n.name,
                     username: n.username.as_deref(),
-                    password: &n.password,
+                    password: Some(&n.password),
+                    field: None,
                     uri: n.uri.as_deref(),
                     folder_id: &folder,
                     notes: &notes,
@@ -1197,6 +1233,225 @@ impl Service {
             Resolved::Error(e) => {
                 self.vault_error(p, what, &e).await;
                 None
+            }
+        }
+    }
+
+    /// Store an API key the agent has as a hidden field of an item, or of a
+    /// new login when there is no such item. A value it replaces stays on the
+    /// item. The value never comes back: only username, URI and item id.
+    async fn save_field(&mut self, p: Pending, f: intent::SaveField, reply: ReplyTx) {
+        let what = format!("field {} {}", f.item, f.name);
+        if !self.admit(&p, &what).await || !self.sync(&p, &what).await {
+            return deny(reply);
+        }
+        let date = bitwarden::utc_date(now_secs());
+        match self.vault.resolve(&f.item).await {
+            Resolved::Item(mut item) => {
+                let id = item["id"].as_str().map(String::from);
+                let name = item["name"].as_str().map(String::from);
+                let username = item["login"]["username"]
+                    .as_str()
+                    .filter(|u| !u.is_empty())
+                    .map(String::from);
+                let uri = item["login"]["uris"][0]["uri"].as_str().map(String::from);
+                let state = bitwarden::field_state(&item, &f.name, &f.value);
+                wipe(&mut item);
+                let Some(id) = id else {
+                    self.record(&p.device, &what, "refused (item has no id)");
+                    return deny(reply);
+                };
+                let (change, field_shown) = match state {
+                    bitwarden::FieldState::Same => {
+                        self.record(&p.recipient(), &what, "unchanged");
+                        return release(
+                            reply,
+                            CredentialData {
+                                username: None,
+                                password: None,
+                                totp: None,
+                                uri: None,
+                                notes: None,
+                                credential_id: None,
+                                domain: Some("unchanged".to_string()),
+                            },
+                        );
+                    }
+                    bitwarden::FieldState::Ambiguous(n) => {
+                        self.record(
+                            &p.device,
+                            &what,
+                            &format!("refused ({n} fields named {})", f.name),
+                        );
+                        return deny(reply);
+                    }
+                    bitwarden::FieldState::Linked => {
+                        self.record(&p.device, &what, "refused (field is linked)");
+                        return deny(reply);
+                    }
+                    bitwarden::FieldState::Absent | bitwarden::FieldState::Empty => {
+                        (FieldChange::Add, f.name.clone())
+                    }
+                    bitwarden::FieldState::Present { vault_name } => (
+                        FieldChange::Replace {
+                            archived: format!("{vault_name} (replaced {date})"),
+                        },
+                        vault_name,
+                    ),
+                };
+                let shown = name.unwrap_or_else(|| f.item.clone());
+                let reason = save_field_reason(
+                    &p.who,
+                    &shown,
+                    username.as_deref(),
+                    &field_shown,
+                    &change,
+                    p.why.as_deref(),
+                );
+                if !self.approve(&p, &what, reason).await {
+                    return deny(reply);
+                }
+                match self.vault.set_field(&id, &f.name, &f.value, &date).await {
+                    Ok(write @ (FieldWrite::Added | FieldWrite::Replaced { .. })) => {
+                        self.after_write().await;
+                        let outcome = match write {
+                            FieldWrite::Replaced { archived } => format!(
+                                "field replaced (old value kept as \u{201c}{archived}\u{201d})"
+                            ),
+                            _ => "field saved".to_string(),
+                        };
+                        self.record(&p.recipient(), &what, &outcome);
+                        release(
+                            reply,
+                            CredentialData {
+                                username,
+                                password: None,
+                                totp: None,
+                                uri,
+                                notes: None,
+                                credential_id: Some(id),
+                                domain: None,
+                            },
+                        );
+                    }
+                    Ok(FieldWrite::Unchanged) => {
+                        self.record(&p.recipient(), &what, "unchanged");
+                        deny(reply);
+                    }
+                    Ok(FieldWrite::Ambiguous(n)) => {
+                        self.record(
+                            &p.device,
+                            &what,
+                            &format!("refused ({n} fields named {})", f.name),
+                        );
+                        deny(reply);
+                    }
+                    Ok(FieldWrite::Linked) => {
+                        self.record(&p.device, &what, "refused (field is linked)");
+                        deny(reply);
+                    }
+                    Err(e) => {
+                        self.vault_error(&p, &what, &e).await;
+                        deny(reply);
+                    }
+                }
+            }
+            Resolved::NotFound => self.save_field_new(p, f, &what, reply).await,
+            Resolved::Locked => {
+                self.lock("bw reported the vault locked").await;
+                self.record(&p.device, &what, "denied (vault locked)");
+                deny(reply);
+            }
+            Resolved::Ambiguous(n) => {
+                self.record(
+                    &p.device,
+                    &what,
+                    &format!("ambiguous ({n} logins match; request by item id)"),
+                );
+                deny(reply);
+            }
+            Resolved::Error(e) => {
+                self.vault_error(&p, &what, &e).await;
+                deny(reply);
+            }
+        }
+    }
+
+    /// `savefield:` for an item that does not exist yet: a new login in
+    /// `Agent-created` that holds the field.
+    async fn save_field_new(
+        &mut self,
+        p: Pending,
+        f: intent::SaveField,
+        what: &str,
+        reply: ReplyTx,
+    ) {
+        let Some(login_name) = intent::new_login_name(&f.item) else {
+            self.record(&p.device, what, "not found");
+            return deny(reply);
+        };
+        let uri = f.uri.clone().or_else(|| intent::new_login_uri(&f.item));
+        if !self.may_create(&p, what, &login_name, uri.as_deref()).await {
+            return deny(reply);
+        }
+        let reason = save_field_reason(
+            &p.who,
+            &login_name,
+            f.username.as_deref(),
+            &f.name,
+            &FieldChange::Create,
+            p.why.as_deref(),
+        );
+        if !self.approve(&p, what, reason).await
+            || !self.may_create(&p, what, &login_name, uri.as_deref()).await
+        {
+            return deny(reply);
+        }
+        let written = async {
+            let folder = self
+                .vault
+                .agent_folder(true)
+                .await?
+                .ok_or("no Agent-created folder")?;
+            let notes = format!(
+                "Saved by aac-touchid for {} on {}: {}",
+                p.agent.as_deref().unwrap_or("an agent"),
+                p.device,
+                p.why.as_deref().unwrap_or("no reason given")
+            );
+            self.vault
+                .create_login(&bitwarden::NewLogin {
+                    name: &login_name,
+                    username: f.username.as_deref(),
+                    password: None,
+                    field: Some((&f.name, &f.value)),
+                    uri: uri.as_deref(),
+                    folder_id: &folder,
+                    notes: &notes,
+                })
+                .await
+        }
+        .await;
+        match written {
+            Ok(id) => {
+                self.after_write().await;
+                self.record(&p.recipient(), what, "field saved (new login)");
+                release(
+                    reply,
+                    CredentialData {
+                        username: f.username,
+                        password: None,
+                        totp: None,
+                        uri,
+                        notes: None,
+                        credential_id: Some(id),
+                        domain: None,
+                    },
+                );
+            }
+            Err(e) => {
+                self.vault_error(&p, what, &e).await;
+                deny(reply);
             }
         }
     }
@@ -1900,6 +2155,25 @@ mod tests {
             )
         );
         assert!(batch_reason("w", &lines[..1], None, None).starts_with("share 1 login\n"));
+        let add = save_field_reason("w", "x", None, "K", &FieldChange::Add, None);
+        assert!(add.starts_with("save the field \u{201c}K\u{201d} the agent supplied\n\n"));
+        let replace = save_field_reason(
+            "w",
+            "x",
+            None,
+            "API Key",
+            &FieldChange::Replace {
+                archived: "API Key (replaced 2026-11-17)".into(),
+            },
+            None,
+        );
+        assert!(replace.starts_with(
+            "replace the field \u{201c}API Key\u{201d} with a value the agent supplied, keeping the old one as \u{201c}API Key (replaced 2026-11-17)\u{201d}\n\n"
+        ));
+        let create = save_field_reason("w", "x", None, "K", &FieldChange::Create, None);
+        assert!(create.starts_with(
+            "create a login and save the field \u{201c}K\u{201d} the agent supplied\n\n"
+        ));
         assert!(
             credential_reason("w", "x", None, "field \u{201c}API Key\u{201d}", None, None)
                 .starts_with("share a field \u{201c}API Key\u{201d}\n\n")

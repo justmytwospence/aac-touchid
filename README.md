@@ -69,6 +69,7 @@ aac run --domain "totp:acme.io secret=JBSWY3DPEHPK3PXP | pi · homelab | enroll 
 | `new:<name> [user=<u>] [url=<full url>] [words=3-20]` | Creates a login named `<name>` with a passphrase from `bw`'s generator and releases username, password, URI and item id. The default is 6 capitalized words joined by `-`, one with a digit (`Violet-Shrug0-Broken-Lantern-Mosaic-Thirsty`); `words=` sets the count. For a random password instead, give `length=12-128` (default 24) and/or `symbols=no`; these cannot be combined with `words=`. If `<name>` looks like a host (`acme.io`), the URI defaults to `https://<name>`. |
 | `rotate:<item> [user=<u>] [words=3-20] [length=12-128] [symbols=no]` | Replaces the password of an existing login with a generated one (the same formats as `new:`) and releases its username, new password, URI and item id. `user=` also sets the login's username in the same write; the sheet says so (`..., set the username to <u>, and share it`). `<item>` is found like a read finds it: name the host you sign in on (`rotate:speedtest.example.com`), or use an item id. The old password stays in the item's password history. |
 | `save:<name> [user=<u>] [url=<full url>] password64=<base64>` | Stores a password the agent already has as a new login (for example one it read from a config file) and releases the username, URI and item id, not the password. `password64` is the password in base64 (standard or URL-safe, 1-512 bytes of text), so characters like `\|`, `=` and spaces survive the request format. |
+| `savefield:<item> name=<NAME> value64=<base64> [user=<u>] [url=<full url>]` | Stores an API key the agent already has as a hidden custom field, and releases the username, URI and item id, not the value. `<item>` is one word, found like `rotate:` finds it (a host, a name, or an item id); any item type works, yours included. When no item is found, a new login `<item>` is created in `Agent-created` that holds the field (see Saving an API key). `value64` is the key in base64 (1-4096 bytes of text). |
 | `totp:<item> secret=<base32>` | Stores a TOTP seed on a login and releases its username and current code, so the agent can confirm enrollment. |
 | `totp:<item> uri=otpauth://totp/...?secret=...` | The same, from an `otpauth://` URI; its other parameters (digits, period, algorithm) are kept. |
 | anything else | A normal read, unchanged. |
@@ -85,6 +86,23 @@ aac run --domain "rotate:speedtest.example.com | pi · homelab | rotate admin pa
 # Store a password you already have. Prefer rotate: when the service allows it.
 aac connect --domain "save:Letterboxarr user=admin url=https://letterboxarr.example.com password64=$(printf %s "$PW" | base64 | tr -d '\n') | pi · homelab | store existing login" --output json
 ```
+
+### Saving an API key
+
+```sh
+aac connect --domain "savefield:openai.com name=API_KEY value64=$(printf %s "$KEY" | base64 | tr -d '\n') | pi · homelab | store new API key" --output json
+```
+
+- With an existing item, the key becomes a hidden field `NAME` on it. If a field of that name (ignoring case, `_` for a space) already holds another value, the old value is never lost: that field is renamed `NAME (replaced YYYY-MM-DD)` (with ` #2`, ` #3` if taken) and stays on the item, and the new value goes in a hidden field under the old name. Delete the old field in Bitwarden once the old key is revoked. The listener reads the item again right before writing, and reports success only after the reply shows both values.
+- The same value already stored writes nothing (`unchanged`, no sheet). An empty field of that name is filled in place. Two fields with that name, or a linked field, are refused.
+- With no item, a login named `<item>` is created in `Agent-created` with no password and the field, with the same duplicate guard as `new:`. Its URI is `url=`, or `https://<item>` when `<item>` looks like a host; `user=` sets its username. `user=` and `url=` are ignored when the item exists. An item id that matches nothing, or a name `new:` would refuse, is not created.
+- Each write shows its own sheet and never uses or creates a grant:
+
+> Bitwarden is trying to save the field “API_KEY” the agent supplied
+
+> Bitwarden is trying to replace the field “API_KEY” with a value the agent supplied, keeping the old one as “API_KEY (replaced 2026-11-17)”
+
+> Bitwarden is trying to create a login and save the field “API_KEY” the agent supplied
 
 Each write shows its own Touch ID sheet. A new login's sheet names the password format (`6-word passphrase`, `32-character password`, `24-character password without symbols`), never the password:
 
@@ -224,7 +242,8 @@ Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents
 - `why:` releases only the asking device's own decision records (request labels and outcomes), without a sheet.
 - Only username, password, URI, the current 2FA code (never the TOTP seed) and a custom field the agent names, shown on the sheet, are released.
 - A grant covers only the fields its sheet named: approving a password does not release the item's custom fields, nor the reverse.
-- A `totp:` seed or `save:` password is in the requesting machine's `aac` command line while it runs, where processes of the same user there can read it, and the agent has seen it once on the signup page. It leaves the listener only inside the encrypted vault: logs and `status` show `totp:<item> [redacted]` and `2FA <item>`. Generated passwords and seeds are wiped from the listener's request buffers after use.
+- `savefield:` never deletes or overwrites a stored value: a replaced value is kept on the item as `NAME (replaced DATE)`.
+- A `totp:` seed, `save:` password or `savefield:` value is in the requesting machine's `aac` command line while it runs, where processes of the same user there can read it, and the agent has seen it once on the signup page. It leaves the listener only inside the encrypted vault: logs and `status` show `totp:<item> [redacted]` and `2FA <item>`. Generated passwords and seeds are wiped from the listener's request buffers after use.
 - Agent names are reduced to letters, digits, spaces and `· . - _ / @`, so a name cannot fake a device suffix or extra lines. Pairing completes only within 5 minutes of `aac-touchid pair`, and the sheet names the device and when its code was issued.
 - The relay sees only device fingerprints and timing (Noise protocol, end to end).
 
