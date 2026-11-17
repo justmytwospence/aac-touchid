@@ -1,6 +1,6 @@
 //! Approvals the user gave for later: `remember=` windows and one-shot batches.
-//! Keyed on the verified device and the resolved vault item id, never the
-//! self-reported agent name. In memory only; cleared on lock and on `forget`.
+//! Keyed on the verified device, the resolved vault item id and the custom
+//! field (none for a plain read), never the self-reported agent name. In memory only; cleared on lock and on `forget`.
 
 use std::time::{Duration, Instant};
 
@@ -37,12 +37,23 @@ pub struct Grant {
     pub device: IdentityFingerprint,
     pub device_label: String,
     pub item_id: String,
+    /// The custom field the sheet named; `None` for a plain read.
+    pub field: Option<String>,
     /// Display name, for status.
     pub item: String,
     pub kind: Kind,
     pub expires: Instant,
     /// `None` means unlimited until expiry.
     pub uses_left: Option<u32>,
+}
+
+/// Whether two grants name the same field (none, or the same name in any case).
+pub fn same_field(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
 }
 
 #[derive(Default)]
@@ -52,11 +63,11 @@ pub struct Grants {
 
 impl Grants {
     pub fn add(&mut self, g: Grant) {
-        if let Some(i) = self
-            .list
-            .iter()
-            .position(|e| e.device == g.device && e.item_id == g.item_id)
-        {
+        if let Some(i) = self.list.iter().position(|e| {
+            e.device == g.device
+                && e.item_id == g.item_id
+                && same_field(e.field.as_deref(), g.field.as_deref())
+        }) {
             let e = &self.list[i];
             if e.kind == Kind::Remembered && e.expires >= g.expires {
                 return;
@@ -67,24 +78,33 @@ impl Grants {
     }
 
     /// Whether a live remembered grant covers this item, without using it.
-    pub fn remembers(&mut self, device: &IdentityFingerprint, item_id: &str, now: Instant) -> bool {
+    pub fn remembers(
+        &mut self,
+        device: &IdentityFingerprint,
+        item_id: &str,
+        field: Option<&str>,
+        now: Instant,
+    ) -> bool {
         self.list.retain(|g| g.expires > now);
-        self.list
-            .iter()
-            .any(|g| g.device == *device && g.item_id == item_id && g.kind == Kind::Remembered)
+        self.list.iter().any(|g| {
+            g.device == *device
+                && g.item_id == item_id
+                && same_field(g.field.as_deref(), field)
+                && g.kind == Kind::Remembered
+        })
     }
 
     pub fn take(
         &mut self,
         device: &IdentityFingerprint,
         item_id: &str,
+        field: Option<&str>,
         now: Instant,
     ) -> Option<Kind> {
         self.list.retain(|g| g.expires > now);
-        let i = self
-            .list
-            .iter()
-            .position(|g| g.device == *device && g.item_id == item_id)?;
+        let i = self.list.iter().position(|g| {
+            g.device == *device && g.item_id == item_id && same_field(g.field.as_deref(), field)
+        })?;
         let kind = self.list[i].kind;
         if let Some(n) = self.list[i].uses_left {
             if n <= 1 {
@@ -131,6 +151,7 @@ mod tests {
             device,
             device_label: "nuc".into(),
             item_id: id.into(),
+            field: None,
             item: "GitHub".into(),
             kind,
             expires: Instant::now() + Duration::from_secs(secs),
@@ -143,8 +164,8 @@ mod tests {
         let d = fp();
         let mut g = Grants::default();
         g.add(grant(d, "a", Kind::Batch, 120));
-        assert_eq!(g.take(&d, "a", Instant::now()), Some(Kind::Batch));
-        assert_eq!(g.take(&d, "a", Instant::now()), None);
+        assert_eq!(g.take(&d, "a", None, Instant::now()), Some(Kind::Batch));
+        assert_eq!(g.take(&d, "a", None, Instant::now()), None);
     }
 
     #[test]
@@ -154,9 +175,15 @@ mod tests {
         let gr = grant(d, "a", Kind::Remembered, 60);
         let expires = gr.expires;
         g.add(gr);
-        assert_eq!(g.take(&d, "a", Instant::now()), Some(Kind::Remembered));
-        assert_eq!(g.take(&d, "a", Instant::now()), Some(Kind::Remembered));
-        assert_eq!(g.take(&d, "a", expires), None);
+        assert_eq!(
+            g.take(&d, "a", None, Instant::now()),
+            Some(Kind::Remembered)
+        );
+        assert_eq!(
+            g.take(&d, "a", None, Instant::now()),
+            Some(Kind::Remembered)
+        );
+        assert_eq!(g.take(&d, "a", None, expires), None);
     }
 
     #[test]
@@ -165,11 +192,11 @@ mod tests {
         let mut g = Grants::default();
         g.add(grant(d, "a", Kind::Remembered, 60));
         g.add(grant(d, "b", Kind::Batch, 60));
-        assert!(g.remembers(&d, "a", Instant::now()));
-        assert!(g.remembers(&d, "a", Instant::now()), "not consumed");
-        assert!(!g.remembers(&d, "b", Instant::now()));
-        assert!(!g.remembers(&fp(), "a", Instant::now()));
-        assert!(!g.remembers(&d, "a", Instant::now() + Duration::from_secs(61)));
+        assert!(g.remembers(&d, "a", None, Instant::now()));
+        assert!(g.remembers(&d, "a", None, Instant::now()), "not consumed");
+        assert!(!g.remembers(&d, "b", None, Instant::now()));
+        assert!(!g.remembers(&fp(), "a", None, Instant::now()));
+        assert!(!g.remembers(&d, "a", None, Instant::now() + Duration::from_secs(61)));
     }
 
     #[test]
@@ -177,8 +204,8 @@ mod tests {
         let (d, e) = (fp(), fp());
         let mut g = Grants::default();
         g.add(grant(d, "a", Kind::Remembered, 60));
-        assert_eq!(g.take(&e, "a", Instant::now()), None);
-        assert_eq!(g.take(&d, "b", Instant::now()), None);
+        assert_eq!(g.take(&e, "a", None, Instant::now()), None);
+        assert_eq!(g.take(&d, "b", None, Instant::now()), None);
     }
 
     #[test]
@@ -187,8 +214,14 @@ mod tests {
         let mut g = Grants::default();
         g.add(grant(d, "a", Kind::Remembered, 600));
         g.add(grant(d, "a", Kind::Batch, 120));
-        assert_eq!(g.take(&d, "a", Instant::now()), Some(Kind::Remembered));
-        assert_eq!(g.take(&d, "a", Instant::now()), Some(Kind::Remembered));
+        assert_eq!(
+            g.take(&d, "a", None, Instant::now()),
+            Some(Kind::Remembered)
+        );
+        assert_eq!(
+            g.take(&d, "a", None, Instant::now()),
+            Some(Kind::Remembered)
+        );
 
         let mut g = Grants::default();
         g.add(grant(d, "a", Kind::Remembered, 60));
@@ -196,6 +229,31 @@ mod tests {
         let snap = g.snapshot(Instant::now());
         assert_eq!(snap.len(), 1);
         assert!(snap[0].expires_in > 60);
+    }
+
+    #[test]
+    fn fields_are_separate_grants() {
+        let d = fp();
+        let mut g = Grants::default();
+        let mut keyed = grant(d, "a", Kind::Remembered, 60);
+        keyed.field = Some("K".into());
+        g.add(keyed);
+        assert_eq!(g.take(&d, "a", None, Instant::now()), None);
+        assert!(!g.remembers(&d, "a", None, Instant::now()));
+        assert!(g.remembers(&d, "a", Some("k"), Instant::now()));
+        assert_eq!(
+            g.take(&d, "a", Some("k"), Instant::now()),
+            Some(Kind::Remembered)
+        );
+        assert_eq!(g.take(&d, "a", Some("other"), Instant::now()), None);
+
+        let mut g = Grants::default();
+        g.add(grant(d, "a", Kind::Remembered, 60));
+        assert_eq!(g.take(&d, "a", Some("K"), Instant::now()), None);
+        let mut keyed = grant(d, "a", Kind::Remembered, 60);
+        keyed.field = Some("K".into());
+        g.add(keyed);
+        assert_eq!(g.snapshot(Instant::now()).len(), 2);
     }
 
     #[test]

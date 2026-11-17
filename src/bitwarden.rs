@@ -36,25 +36,35 @@ pub enum Lookup {
     NotFound,
     /// Several logins match; the requester must ask by item id.
     Ambiguous(usize),
+    /// A field read: the item has no releasable field of that name.
+    FieldNotFound,
+    /// A field read: several fields have that name.
+    FieldAmbiguous(usize),
     Locked,
     Error(String),
 }
 
 /// Which secret fields a release contains, for the approval sheet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fields {
     pub password: bool,
     pub totp: bool,
+    /// The vault's name of the one custom field a field read releases.
+    pub custom: Option<String>,
 }
 
 impl Fields {
-    pub fn describe(&self) -> &'static str {
+    pub fn describe(&self) -> String {
+        if let Some(n) = &self.custom {
+            return format!("field \u{201c}{n}\u{201d}");
+        }
         match (self.password, self.totp) {
             (true, true) => "password + 2FA code",
             (true, false) => "password",
             (false, true) => "2FA code",
             (false, false) => "username only",
         }
+        .to_string()
     }
 }
 
@@ -115,6 +125,16 @@ struct BwItem {
     id: Option<String>,
     name: Option<String>,
     login: Option<BwLogin>,
+    #[serde(default)]
+    fields: Option<Vec<BwField>>,
+}
+
+#[derive(Deserialize)]
+struct BwField {
+    name: Option<String>,
+    value: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -417,18 +437,38 @@ impl Vault {
     /// so a miss syncs once and looks again: an item made elsewhere since the
     /// last sync (unlock or write) is found instead of denied.
     pub async fn lookup(&mut self, query: &CredentialQuery) -> Lookup {
+        match self.find(query).await {
+            Resolved::Item(v) => match serde_json::from_value::<BwItem>(v) {
+                Ok(item) => self.credential_from(item).await,
+                Err(e) => Lookup::Error(format!("parse item: {e}")),
+            },
+            Resolved::NotFound => Lookup::NotFound,
+            Resolved::Ambiguous(n) => Lookup::Ambiguous(n),
+            Resolved::Locked => Lookup::Locked,
+            Resolved::Error(e) => Lookup::Error(e),
+        }
+    }
+
+    /// Resolve a query; a miss syncs once and looks again.
+    async fn find(&mut self, query: &CredentialQuery) -> Resolved {
         let search = query.search_string();
         let mut found = self.resolve(search).await;
         if matches!(found, Resolved::NotFound) {
             match self.sync().await {
                 Ok(()) => found = self.resolve(search).await,
-                Err(_) if !self.unlocked => return Lookup::Locked,
+                Err(_) if !self.unlocked => return Resolved::Locked,
                 Err(e) => tracing::warn!("sync after a miss failed: {e}"),
             }
         }
-        match found {
+        found
+    }
+
+    /// Like [`Vault::lookup`], but releases one custom field (as the
+    /// password) of any type of item, not the login.
+    pub async fn lookup_field(&mut self, query: &CredentialQuery, field: &str) -> Lookup {
+        match self.find(query).await {
             Resolved::Item(v) => match serde_json::from_value::<BwItem>(v) {
-                Ok(item) => self.credential_from(item).await,
+                Ok(item) => field_from(item, field),
                 Err(e) => Lookup::Error(format!("parse item: {e}")),
             },
             Resolved::NotFound => Lookup::NotFound,
@@ -713,6 +753,7 @@ impl Vault {
         let fields = Fields {
             password: login.password.is_some(),
             totp: totp.is_some(),
+            custom: None,
         };
         // Notes are deliberately not released: they can hold recovery codes.
         Lookup::Found(
@@ -729,6 +770,70 @@ impl Vault {
             fields,
         )
     }
+}
+
+/// Which of an item's custom fields a request names: text, hidden or boolean
+/// ones (not linked) whose name matches, exactly one of which must have a value.
+fn pick_field(fields: &[BwField], wanted: &str) -> Result<usize, Lookup> {
+    let hits: Vec<usize> = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.kind.unwrap_or(0) <= 2)
+        .filter(|(_, f)| {
+            f.name
+                .as_deref()
+                .is_some_and(|n| crate::intent::field_matches(n, wanted))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    match hits.as_slice() {
+        [] => Err(Lookup::FieldNotFound),
+        [i] if fields[*i].value.as_deref().is_some_and(|v| !v.is_empty()) => Ok(*i),
+        [_] => Err(Lookup::FieldNotFound),
+        more => Err(Lookup::FieldAmbiguous(more.len())),
+    }
+}
+
+/// The credential a field read releases: the field's value in the password
+/// slot, with the login's username and URI when the item has them.
+fn field_from(item: BwItem, wanted: &str) -> Lookup {
+    let fields = item.fields.unwrap_or_default();
+    let i = match pick_field(&fields, wanted) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let (vault_name, value) = (
+        fields[i].name.clone().unwrap_or_default(),
+        fields[i].value.clone().unwrap_or_default(),
+    );
+    let (username, uri) = match item.login {
+        Some(l) => (
+            l.username,
+            l.uris.iter().flatten().find_map(|u| u.uri.clone()),
+        ),
+        None => (None, None),
+    };
+    let domain = uri
+        .as_deref()
+        .and_then(host_of)
+        .or_else(|| item.name.clone());
+    Lookup::Found(
+        Box::new(CredentialData {
+            username,
+            password: Some(Zeroizing::new(value)),
+            totp: None,
+            uri,
+            notes: None,
+            credential_id: item.id,
+            domain,
+        }),
+        item.name,
+        Fields {
+            password: false,
+            totp: false,
+            custom: Some(vault_name),
+        },
+    )
 }
 
 async fn roundtrip(
@@ -1117,7 +1222,8 @@ mod tests {
         assert_eq!(
             Fields {
                 password: true,
-                totp: true
+                totp: true,
+                custom: None
             }
             .describe(),
             "password + 2FA code"
@@ -1125,11 +1231,64 @@ mod tests {
         assert_eq!(
             Fields {
                 password: true,
-                totp: false
+                totp: false,
+                custom: None
             }
             .describe(),
             "password"
         );
+        assert_eq!(
+            Fields {
+                password: false,
+                totp: false,
+                custom: Some("API Key".into())
+            }
+            .describe(),
+            "field \u{201c}API Key\u{201d}"
+        );
+    }
+
+    fn bwf(name: &str, value: Option<&str>, kind: u8) -> BwField {
+        BwField {
+            name: Some(name.into()),
+            value: value.map(String::from),
+            kind: Some(kind),
+        }
+    }
+
+    #[test]
+    fn field_picks() {
+        let fields = [
+            bwf("API Key", Some("sk"), 1),
+            bwf("Link", None, 3),
+            bwf("Empty", Some(""), 1),
+            bwf("Flag", Some("true"), 2),
+            bwf("Dup", Some("a"), 0),
+            bwf("dup", Some("b"), 1),
+            bwf("Linked", Some("x"), 3),
+        ];
+        assert!(matches!(pick_field(&fields, "api_key"), Ok(0)));
+        assert!(matches!(
+            pick_field(&fields, "Link"),
+            Err(Lookup::FieldNotFound)
+        ));
+        assert!(matches!(
+            pick_field(&fields, "Linked"),
+            Err(Lookup::FieldNotFound)
+        ));
+        assert!(matches!(
+            pick_field(&fields, "empty"),
+            Err(Lookup::FieldNotFound)
+        ));
+        assert!(matches!(pick_field(&fields, "flag"), Ok(3)));
+        assert!(matches!(
+            pick_field(&fields, "dup"),
+            Err(Lookup::FieldAmbiguous(2))
+        ));
+        assert!(matches!(
+            pick_field(&fields, "nope"),
+            Err(Lookup::FieldNotFound)
+        ));
     }
 
     #[tokio::test]
@@ -1161,8 +1320,8 @@ mod tests {
 s = socket.socket(fileno=3)
 folders = []
 syncs = 0
-later = {"i9": {"id": "i9", "type": 1, "folderId": None, "name": "ElevenLabs", "notes": None, "login": {"username": "el", "password": "pw", "totp": None, "uris": [{"uri": "elevenlabs.io"}]}}}
-items = {"i1": {"id": "i1", "type": 1, "folderId": None, "name": "GitHub", "notes": "RECOVERY", "login": {"username": "me", "password": "pw", "totp": "SEED", "uris": [{"uri": "https://github.com/login"}]}}}
+later = {"i9": {"id": "i9", "type": 1, "folderId": None, "name": "ElevenLabs", "notes": None, "login": {"username": "el", "password": "pw", "totp": None, "uris": [{"uri": "elevenlabs.io"}]}}, "n9": {"id": "n9", "type": 2, "folderId": None, "name": "OpenAI", "notes": "SECRET", "login": None, "fields": [{"name": "API_KEY", "value": "sk-2", "type": 1}]}}
+items = {"i1": {"id": "i1", "type": 1, "folderId": None, "name": "GitHub", "notes": "RECOVERY", "fields": [{"name": "API Key", "value": "sk-1", "type": 1}, {"name": "Link", "value": None, "type": 3}], "login": {"username": "me", "password": "pw", "totp": "SEED", "uris": [{"uri": "https://github.com/login"}]}}}
 leak = any("hunter2" in v for v in os.environ.values()) or any("hunter2" in a for a in sys.argv)
 f = s.makefile("rb")
 while True:
@@ -1182,7 +1341,7 @@ while True:
     q = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
     def hit(i, term):
         term = urllib.parse.unquote(term).lower()
-        return term in i["name"].lower() or any(term in u["uri"] for u in i["login"]["uris"])
+        return term in i["name"].lower() or any(term in u["uri"] for u in ((i.get("login") or {}).get("uris") or []))
     if route == "/sync":
         # The first sync (at unlock) predates the item made elsewhere.
         syncs += 1
@@ -1263,7 +1422,8 @@ while True:
                     fields,
                     Fields {
                         password: true,
-                        totp: true
+                        totp: true,
+                        custom: None
                     }
                 );
             }
@@ -1284,6 +1444,40 @@ while True:
         assert!(matches!(
             v.lookup(&CredentialQuery::Domain("nowhere.example".into()))
                 .await,
+            Lookup::NotFound
+        ));
+
+        // Custom fields: the value comes back as the password, nothing else secret.
+        match v
+            .lookup_field(&CredentialQuery::Domain("github.com".into()), "api_key")
+            .await
+        {
+            Lookup::Found(c, _, fields) => {
+                assert_eq!(c.password.as_deref().map(String::as_str), Some("sk-1"));
+                assert_eq!(c.username.as_deref(), Some("me"));
+                assert!(c.totp.is_none() && c.notes.is_none());
+                assert_eq!(fields.custom.as_deref(), Some("API Key"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            v.lookup_field(&CredentialQuery::Domain("github.com".into()), "Link")
+                .await,
+            Lookup::FieldNotFound
+        ));
+        match v
+            .lookup_field(&CredentialQuery::Id("n9".into()), "API_KEY")
+            .await
+        {
+            Lookup::Found(c, name, _) => {
+                assert_eq!(name.as_deref(), Some("OpenAI"));
+                assert_eq!(c.password.as_deref().map(String::as_str), Some("sk-2"));
+                assert!(c.username.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            v.lookup(&CredentialQuery::Id("n9".into())).await,
             Lookup::NotFound
         ));
 

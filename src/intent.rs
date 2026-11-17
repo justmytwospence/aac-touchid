@@ -18,7 +18,10 @@
 //!   refused.
 //! - `<item> remember=15m` is a read that also asks to release the same item
 //!   again for that long (1m-24h) without another sheet.
-//! - `batch:<a>,<b>,... [remember=15m]` approves several items on one sheet.
+//! - `<item> field=<NAME>` reads one custom field of an item (its value
+//!   arrives in the password slot); it combines with `remember=`.
+//! - `batch:<a>,<b>,... [remember=15m]` approves several items on one sheet;
+//!   an entry may be `<item>#field:<NAME>`.
 //!
 //! Anything else is a read. Parsing is pure. Errors are fixed strings that
 //! never echo the request, which may hold a seed.
@@ -38,6 +41,7 @@ pub const MAX_WORDS: u32 = 20;
 pub const DEFAULT_WORDS: u32 = 6;
 pub const MAX_BATCH: usize = 10;
 const MAX_NAME: usize = 64;
+const MAX_FIELD: usize = 64;
 const MAX_ITEM: usize = 128;
 const MAX_USER: usize = 128;
 const MAX_URL: usize = 2048;
@@ -63,12 +67,31 @@ pub enum Intent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Read {
     pub item: String,
+    /// One custom field of the item, instead of its login.
+    pub field: Option<String>,
     pub remember: Option<Duration>,
+}
+
+/// One batch entry: an item, and optionally one of its custom fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub item: String,
+    pub field: Option<String>,
+}
+
+impl Target {
+    /// `item` or `item#field:NAME`, as written in `batch:`.
+    pub fn label(&self) -> String {
+        match &self.field {
+            Some(f) => format!("{}#field:{f}", self.item),
+            None => self.item.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch {
-    pub items: Vec<String>,
+    pub items: Vec<Target>,
     pub remember: Option<Duration>,
 }
 
@@ -178,6 +201,7 @@ pub enum ParseError {
     OtpauthWithoutSecret,
     EmptyItem,
     BadRemember,
+    BadField,
     EmptyBatch,
     TooManyItems,
     DuplicateItem,
@@ -212,6 +236,7 @@ impl fmt::Display for ParseError {
             Self::OtpauthWithoutSecret => "otpauth uri has no secret",
             Self::EmptyItem => "request names no item",
             Self::BadRemember => "remember must be 1m-24h, like 15m or 2h",
+            Self::BadField => "field must be 1-64 letters, digits or _ . -",
             Self::EmptyBatch => "batch: needs items",
             Self::TooManyItems => "batch: at most 10 items",
             Self::DuplicateItem => "item listed twice",
@@ -272,26 +297,73 @@ fn is_remember(word: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case("remember="))
 }
 
+fn is_field(word: &str) -> bool {
+    word.get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("field="))
+}
+
+/// A custom field's name in a request: 1-64 of `A-Z a-z 0-9 _ . -`.
+pub fn parse_field(v: &str) -> Result<String, ParseError> {
+    if v.is_empty()
+        || v.len() > MAX_FIELD
+        || !v
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return Err(ParseError::BadField);
+    }
+    Ok(v.to_string())
+}
+
+/// Whether a vault field name is the one a request asked for: a space in the
+/// vault's name is written `_` in requests, and case is ignored.
+pub fn field_matches(vault_name: &str, wanted: &str) -> bool {
+    vault_name
+        .trim()
+        .replace(' ', "_")
+        .eq_ignore_ascii_case(wanted)
+}
+
 fn parse_read(what: &str) -> Result<Read, ParseError> {
     let t = what.trim_end();
-    if is_remember(t.trim_start()) {
+    let lead = t.trim_start();
+    if is_remember(lead) || is_field(lead) {
         return Err(ParseError::EmptyItem);
     }
-    if let Some((head, last)) = t.rsplit_once(char::is_whitespace) {
+    let mut head = t;
+    let mut remember = None;
+    let mut field = None;
+    let mut any = false;
+    while let Some((rest, last)) = head.rsplit_once(char::is_whitespace) {
         if is_remember(last) {
-            let head = head.trim();
-            if head.is_empty() {
-                return Err(ParseError::EmptyItem);
+            if remember.replace(parse_span(&last[9..])?).is_some() {
+                return Err(ParseError::DuplicateOption);
             }
-            return Ok(Read {
-                item: head.to_string(),
-                remember: Some(parse_span(&last[9..])?),
-            });
+        } else if is_field(last) {
+            if field.replace(parse_field(&last[6..])?).is_some() {
+                return Err(ParseError::DuplicateOption);
+            }
+        } else {
+            break;
         }
+        any = true;
+        head = rest.trim_end();
+    }
+    if !any {
+        return Ok(Read {
+            item: what.to_string(),
+            field: None,
+            remember: None,
+        });
+    }
+    let item = head.trim();
+    if item.is_empty() {
+        return Err(ParseError::EmptyItem);
     }
     Ok(Read {
-        item: what.to_string(),
-        remember: None,
+        item: item.to_string(),
+        field,
+        remember,
     })
 }
 
@@ -317,18 +389,36 @@ fn parse_batch(rest: &str) -> Result<Batch, ParseError> {
             return Err(ParseError::DuplicateOption);
         }
     }
-    let mut items: Vec<String> = Vec::new();
-    for item in list.split(',') {
-        if item.is_empty() {
+    let mut items: Vec<Target> = Vec::new();
+    for entry in list.split(',') {
+        if entry.is_empty() {
             return Err(ParseError::EmptyBatch);
         }
-        if item.len() > MAX_ITEM || item.chars().any(char::is_control) || item.contains('=') {
+        let (item, field) = match entry.to_ascii_lowercase().find("#field:") {
+            Some(i) => (&entry[..i], Some(parse_field(&entry[i + 7..])?)),
+            None => (entry, None),
+        };
+        if item.is_empty()
+            || item.len() > MAX_ITEM
+            || item.chars().any(char::is_control)
+            || item.contains('=')
+        {
             return Err(ParseError::BadItem);
         }
-        if items.iter().any(|i| i.eq_ignore_ascii_case(item)) {
+        if items.iter().any(|t| {
+            t.item.eq_ignore_ascii_case(item)
+                && match (&t.field, &field) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    _ => false,
+                }
+        }) {
             return Err(ParseError::DuplicateItem);
         }
-        items.push(item.to_string());
+        items.push(Target {
+            item: item.to_string(),
+            field,
+        });
     }
     if items.len() > MAX_BATCH {
         return Err(ParseError::TooManyItems);
@@ -892,6 +982,7 @@ mod tests {
                 parse(s),
                 Ok(Intent::Read(Read {
                     item: s.into(),
+                    field: None,
                     remember: None
                 })),
                 "{s}"
@@ -1098,6 +1189,7 @@ mod tests {
             format!("totp:x uri=otpauth://totp/{secretish}"),
             format!("new:x {secretish}=y"),
             format!("totp:x secret={secretish}9"),
+            format!("x field={secretish}/"),
         ] {
             let e = parse(&s).expect_err(&s).to_string();
             assert!(!e.contains(secretish), "{e}");
@@ -1148,6 +1240,7 @@ mod tests {
             r("github.com remember=15m"),
             Ok(Intent::Read(Read {
                 item: "github.com".into(),
+                field: None,
                 remember: Some(Duration::from_secs(900))
             }))
         );
@@ -1155,6 +1248,7 @@ mod tests {
             r("My Item  REMEMBER=2h"),
             Ok(Intent::Read(Read {
                 item: "My Item".into(),
+                field: None,
                 remember: Some(Duration::from_secs(7200))
             }))
         );
@@ -1171,9 +1265,76 @@ mod tests {
             r("remember.com"),
             Ok(Intent::Read(Read {
                 item: "remember.com".into(),
+                field: None,
                 remember: None
             }))
         );
+    }
+
+    fn t(item: &str) -> Target {
+        Target {
+            item: item.into(),
+            field: None,
+        }
+    }
+
+    #[test]
+    fn read_field() {
+        let read = |s: &str| match parse(s) {
+            Ok(Intent::Read(r)) => r,
+            other => panic!("unexpected {other:?}"),
+        };
+        let r = read("openai.com field=API_KEY");
+        assert_eq!(r.item, "openai.com");
+        assert_eq!(r.field.as_deref(), Some("API_KEY"));
+        assert_eq!(r.remember, None);
+        for s in ["x FIELD=a remember=5m", "x remember=5m field=a"] {
+            let r = read(s);
+            assert_eq!(r.item, "x", "{s}");
+            assert_eq!(r.field.as_deref(), Some("a"), "{s}");
+            assert_eq!(r.remember, Some(Duration::from_secs(300)), "{s}");
+        }
+        assert_eq!(read("My Item field=t").item, "My Item");
+        assert_eq!(parse("field=a"), Err(ParseError::EmptyItem));
+        assert_eq!(parse("field=a x"), Err(ParseError::EmptyItem));
+        assert_eq!(parse("x field="), Err(ParseError::BadField));
+        assert_eq!(parse("x field=a/b"), Err(ParseError::BadField));
+        assert_eq!(
+            parse(&format!("x field={}", "a".repeat(65))),
+            Err(ParseError::BadField)
+        );
+        assert_eq!(
+            parse(&format!("x field={}", "a".repeat(64))).map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(parse("x field=a field=b"), Err(ParseError::DuplicateOption));
+        assert_eq!(read("fieldwork.com").field, None);
+    }
+
+    #[test]
+    fn target_labels() {
+        assert_eq!(t("a.com").label(), "a.com");
+        let f = Target {
+            item: "a.com".into(),
+            field: Some("K".into()),
+        };
+        assert_eq!(f.label(), "a.com#field:K");
+    }
+
+    #[test]
+    fn batch_fields() {
+        let Ok(Intent::Batch(b)) = parse("batch:a.com#field:K,a.com") else {
+            panic!("not a batch")
+        };
+        assert_eq!(b.items.len(), 2);
+        assert_eq!(b.items[0].field.as_deref(), Some("K"));
+        assert_eq!(b.items[1].field, None);
+        assert_eq!(
+            parse("batch:a.com#FIELD:k,a.com#field:K"),
+            Err(ParseError::DuplicateItem)
+        );
+        assert_eq!(parse("batch:#field:k"), Err(ParseError::BadItem));
+        assert_eq!(parse("batch:a.com#field:"), Err(ParseError::BadField));
     }
 
     #[test]
@@ -1181,14 +1342,14 @@ mod tests {
         assert_eq!(
             parse("batch:a.com,b.com"),
             Ok(Intent::Batch(Batch {
-                items: vec!["a.com".into(), "b.com".into()],
+                items: vec![t("a.com"), t("b.com")],
                 remember: None
             }))
         );
         assert_eq!(
             parse("BATCH:a.com remember=10m"),
             Ok(Intent::Batch(Batch {
-                items: vec!["a.com".into()],
+                items: vec![t("a.com")],
                 remember: Some(Duration::from_secs(600))
             }))
         );

@@ -19,7 +19,7 @@ The request travels end to end encrypted through the Agent Access relay to this 
 > **𝗚𝗶𝘁𝗛𝘂𝗯** (you@example.com)
 > check gh login
 
-The sheet has no rich text, so the agent and item names use Unicode mathematical bold letters. macOS titles the sheet with the program's file name, so install a copy of the binary named `Bitwarden` for the service to run (see below). The sheet also says what is released: `password`, `password + 2FA code`, or `username only`. Notes are never released, because they can hold recovery codes.
+The sheet has no rich text, so the agent and item names use Unicode mathematical bold letters. macOS titles the sheet with the program's file name, so install a copy of the binary named `Bitwarden` for the service to run (see below). The sheet also says what is released: `password`, `password + 2FA code`, `username only`, or `field “NAME”` for a custom field. Notes are never released, because they can hold recovery codes.
 
 If you touch the sensor, the secret goes to that device and into the command's environment. If you cancel or don't answer within 60 s, the agent gets `aac` exit code 4 ("Request denied").
 
@@ -33,6 +33,22 @@ A host (`github.com`) or URL (`https://github.com/login` or `github.com/login`, 
 If the first tier with any logins has more than one, the request is denied as ambiguous and the agent must ask by item id. Partial matches (`hub.com`, `github.com.evil.io`, a name or username containing the text) never count, and URIs whose match detection is set to Never or Regular expression are skipped. Anything that is not a host (an item id, a name like `GitHub`) goes to `bw`'s own lookup; when that finds several items, one named exactly that (any case) is chosen, otherwise the request is ambiguous.
 
 Lookups use the listener's own copy of the vault, synced when it unlocks and around writes. When a lookup finds nothing, the listener syncs once and looks again, so an item added elsewhere a moment ago is found.
+
+## Custom fields (API keys)
+
+An API key is often a hidden custom field on a login or note rather than its password. Ask for one field by name after the item:
+
+```sh
+aac run --domain "openai.com field=API_KEY | pi · homelab | list models" \
+  --env OPENAI_API_KEY=password -- ./list-models.sh
+```
+
+- The field's value arrives in the `password` slot, with the login's username, URI and item id. The 2FA code and notes are never included.
+- `NAME` is 1-64 of `A-Z a-z 0-9 _ . -`, matched ignoring case. A space in the vault's field name is written `_` (`API Key` is `field=API_Key`).
+- Text, hidden and boolean fields can be read; linked fields cannot. An empty value counts as not found, and two fields with the same name are refused as ambiguous.
+- A host finds logins as usual. By item id or name, any item type works, so a key on a secure note can be read.
+- It combines with `remember=` and `--id`. In `batch:`, write `<item>#field:<NAME>`: `batch:openai.com#field:API_KEY,github.com`.
+- A grant covers only what its sheet named: approving an item's password does not release its fields, nor the reverse.
 
 ## New logins and 2FA
 
@@ -205,7 +221,8 @@ Trusted: the Mac's logged-in GUI session and the person at it. Untrusted: agents
 - The master password and vault key never go into an environment variable or a command line, where any process of the same user can read it (`ps -E`). The listener runs one `bw serve` child on a private socket pair (`--hostname fd+connected://3`, a supported `bw serve` mode) that no other process can open; the master password travels once in its `POST /unlock` body and the vault key stays inside that child. Locking calls `/lock` and stops the child.
 - `bw login --apikey` reads the API key only from its environment, so on first login the key is in that one short-lived child's environment. The API key alone cannot decrypt the vault.
 - `why:` releases only the asking device's own decision records (request labels and outcomes), without a sheet.
-- Only username, password, URI and the current 2FA code (never the TOTP seed) are released.
+- Only username, password, URI, the current 2FA code (never the TOTP seed) and a custom field the agent names, shown on the sheet, are released.
+- A grant covers only the fields its sheet named: approving a password does not release the item's custom fields, nor the reverse.
 - A `totp:` seed or `save:` password is in the requesting machine's `aac` command line while it runs, where processes of the same user there can read it, and the agent has seen it once on the signup page. It leaves the listener only inside the encrypted vault: logs and `status` show `totp:<item> [redacted]` and `2FA <item>`. Generated passwords and seeds are wiped from the listener's request buffers after use.
 - Agent names are reduced to letters, digits, spaces and `· . - _ / @`, so a name cannot fake a device suffix or extra lines. Pairing completes only within 5 minutes of `aac-touchid pair`, and the sheet names the device and when its code was issued.
 - The relay sees only device fingerprints and timing (Noise protocol, end to end).

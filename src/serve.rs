@@ -264,7 +264,7 @@ fn remember_suffix(r: Option<Duration>) -> String {
 pub struct BatchLine {
     pub name: String,
     pub username: Option<String>,
-    pub fields: &'static str,
+    pub fields: String,
 }
 
 /// One sheet for several items: who, then one line per item, then why.
@@ -667,7 +667,7 @@ impl Service {
                 match intent {
                     Intent::Read(r) => {
                         let q = with_text(&query, r.item);
-                        self.read(p, q, r.remember, reply).await
+                        self.read(p, q, r.field, r.remember, reply).await
                     }
                     Intent::Batch(b) => self.batch(p, b, reply).await,
                     Intent::Create(n) => self.create(p, n, reply).await,
@@ -743,15 +743,36 @@ impl Service {
         &mut self,
         p: Pending,
         query: CredentialQuery,
+        field: Option<String>,
         remember: Option<Duration>,
         reply: ReplyTx,
     ) {
-        let what = query_label(&query);
+        let what = match &field {
+            Some(f) => format!("{} field={f}", query_label(&query)),
+            None => query_label(&query),
+        };
+        let wanted = field.as_deref().unwrap_or_default().to_string();
         if !self.admit(&p, &what).await {
             return deny(reply);
         }
-        let (credential, item_name, fields) = match self.vault.lookup(&query).await {
+        let found = match field.as_deref() {
+            Some(f) => self.vault.lookup_field(&query, f).await,
+            None => self.vault.lookup(&query).await,
+        };
+        let (credential, item_name, fields) = match found {
             Lookup::Found(c, name, fields) => (c, name, fields),
+            Lookup::FieldNotFound => {
+                self.record(&p.device, &what, &format!("not found (no field {wanted})"));
+                return deny(reply);
+            }
+            Lookup::FieldAmbiguous(n) => {
+                self.record(
+                    &p.device,
+                    &what,
+                    &format!("ambiguous ({n} fields named {wanted})"),
+                );
+                return deny(reply);
+            }
             Lookup::Locked => {
                 self.lock("bw reported the vault locked").await;
                 self.record(&p.device, &what, "denied (vault locked)");
@@ -776,9 +797,10 @@ impl Service {
             }
         };
         if let Some(id) = credential.credential_id.as_deref() {
-            let kind = shared(&self.shared)
-                .grants
-                .take(&p.identity, id, Instant::now());
+            let kind =
+                shared(&self.shared)
+                    .grants
+                    .take(&p.identity, id, field.as_deref(), Instant::now());
             if let Some(kind) = kind {
                 self.last_activity = Instant::now();
                 self.record(&p.recipient(), &what, kind.outcome());
@@ -795,7 +817,7 @@ impl Service {
             &p.who,
             &item,
             credential.username.as_deref(),
-            fields.describe(),
+            &fields.describe(),
             p.why.as_deref(),
             remember,
         );
@@ -807,7 +829,8 @@ impl Service {
                 device: p.identity,
                 device_label: p.device.clone(),
                 item_id: id,
-                item: item.clone(),
+                field: field.clone(),
+                item: grant_label(&item, field.as_deref()),
                 kind: Kind::Remembered,
                 expires: Instant::now() + d,
                 uses_left: None,
@@ -820,27 +843,46 @@ impl Service {
     /// Several items on one sheet; approval leaves grants the client's
     /// following reads use.
     async fn batch(&mut self, p: Pending, b: intent::Batch, reply: ReplyTx) {
-        let what = format!("batch {}", b.items.join(","));
+        let labels: Vec<String> = b.items.iter().map(intent::Target::label).collect();
+        let what = format!("batch {}", labels.join(","));
         if !self.admit(&p, &what).await {
             return deny(reply);
         }
-        let mut found: Vec<(String, BatchLine)> = Vec::new();
-        for item in &b.items {
-            match self
-                .vault
-                .lookup(&CredentialQuery::Domain(item.clone()))
-                .await
-            {
+        let mut found: Vec<(String, Option<String>, BatchLine)> = Vec::new();
+        for target in &b.items {
+            let item = &target.item;
+            let label = target.label();
+            let query = CredentialQuery::Domain(item.clone());
+            let looked = match target.field.as_deref() {
+                Some(f) => self.vault.lookup_field(&query, f).await,
+                None => self.vault.lookup(&query).await,
+            };
+            match looked {
+                Lookup::FieldNotFound => {
+                    self.record(&p.device, &what, &format!("not found: {label}"));
+                    return deny(reply);
+                }
+                Lookup::FieldAmbiguous(n) => {
+                    self.record(
+                        &p.device,
+                        &what,
+                        &format!("ambiguous: {label} ({n} fields match)"),
+                    );
+                    return deny(reply);
+                }
                 Lookup::Found(c, name, fields) => {
                     let Some(id) = c.credential_id.clone() else {
                         self.record(&p.device, &what, "refused (item has no id)");
                         return deny(reply);
                     };
-                    if found.iter().any(|(i, _)| *i == id) {
+                    if found.iter().any(|(i, f, _)| {
+                        *i == id && crate::grants::same_field(f.as_deref(), target.field.as_deref())
+                    }) {
                         continue;
                     }
                     found.push((
                         id,
+                        target.field.clone(),
                         BatchLine {
                             name: name
                                 .or_else(|| c.domain.clone())
@@ -856,14 +898,14 @@ impl Service {
                     return deny(reply);
                 }
                 Lookup::NotFound => {
-                    self.record(&p.device, &what, &format!("not found: {item}"));
+                    self.record(&p.device, &what, &format!("not found: {label}"));
                     return deny(reply);
                 }
                 Lookup::Ambiguous(n) => {
                     self.record(
                         &p.device,
                         &what,
-                        &format!("ambiguous: {item} ({n} logins match; request by item id)"),
+                        &format!("ambiguous: {label} ({n} logins match; request by item id)"),
                     );
                     return deny(reply);
                 }
@@ -879,7 +921,7 @@ impl Service {
             let now = Instant::now();
             found
                 .iter()
-                .all(|(id, _)| s.grants.remembers(&p.identity, id, now))
+                .all(|(id, f, _)| s.grants.remembers(&p.identity, id, f.as_deref(), now))
         };
         if covered {
             // Every item is already remembered for this device: the reads
@@ -902,10 +944,10 @@ impl Service {
         let remember = b.remember.and_then(|d| self.cap(d));
         let lines: Vec<BatchLine> = found
             .iter()
-            .map(|(_, l)| BatchLine {
+            .map(|(_, _, l)| BatchLine {
                 name: l.name.clone(),
                 username: l.username.clone(),
-                fields: l.fields,
+                fields: l.fields.clone(),
             })
             .collect();
         let reason = batch_reason(&p.who, &lines, remember, p.why.as_deref());
@@ -916,7 +958,7 @@ impl Service {
         let n = found.len();
         {
             let mut s = shared(&self.shared);
-            for (id, line) in found {
+            for (id, field, line) in found {
                 let (kind, expires, uses_left) = match remember {
                     Some(d) => (Kind::Remembered, now + d, None),
                     None => (Kind::Batch, now + BATCH_WINDOW, Some(1)),
@@ -925,7 +967,8 @@ impl Service {
                     device: p.identity,
                     device_label: p.device.clone(),
                     item_id: id,
-                    item: line.name,
+                    item: grant_label(&line.name, field.as_deref()),
+                    field,
                     kind,
                     expires,
                     uses_left,
@@ -1326,6 +1369,14 @@ impl Service {
         if self.vault.is_unlocked() && self.last_activity.elapsed() >= self.cfg.lock_after {
             self.lock("idle timeout").await;
         }
+    }
+}
+
+/// What `status` shows for a grant: the item, and its field when it has one.
+fn grant_label(item: &str, field: Option<&str>) -> String {
+    match field {
+        Some(f) => format!("{item} \u{b7} field {f}"),
+        None => item.to_string(),
     }
 }
 
@@ -1832,12 +1883,12 @@ mod tests {
             BatchLine {
                 name: "GitHub".into(),
                 username: Some("me".into()),
-                fields: "password",
+                fields: "password".into(),
             },
             BatchLine {
                 name: "npm".into(),
                 username: None,
-                fields: "password + 2FA code",
+                fields: "password + 2FA code".into(),
             },
         ];
         assert_eq!(
@@ -1849,5 +1900,9 @@ mod tests {
             )
         );
         assert!(batch_reason("w", &lines[..1], None, None).starts_with("share 1 login\n"));
+        assert!(
+            credential_reason("w", "x", None, "field \u{201c}API Key\u{201d}", None, None)
+                .starts_with("share a field \u{201c}API Key\u{201d}\n\n")
+        );
     }
 }
