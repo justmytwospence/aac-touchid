@@ -4,7 +4,7 @@
 //! sheet), then reads each item with stock `aac connect --output json`, and
 //! `exec`s the command. Secrets only ever live in that process's environment.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -14,7 +14,8 @@ use ap_client::CredentialData;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use crate::intent;
+use crate::grants::same_field;
+use crate::intent::{self, Target};
 use crate::refs::{self, Part};
 
 pub struct Args {
@@ -104,19 +105,39 @@ fn tail(agent: Option<&str>, reason: Option<&str>) -> String {
     }
 }
 
-/// The batch request (when two or more items) and the per-item reads.
+/// Whether two references fetch the same thing: the same item, and the same
+/// custom field (or none).
+fn same_target(a: &Target, b: &Target) -> bool {
+    a.item == b.item && same_field(a.field.as_deref(), b.field.as_deref())
+}
+
+/// ` field=NAME`, or nothing.
+fn field_option(t: &Target) -> String {
+    t.field
+        .as_ref()
+        .map_or_else(String::new, |f| format!(" field={f}"))
+}
+
+/// The batch request (when two or more targets) and the per-target reads.
 fn plan_domains(
-    items: &[String],
+    targets: &[Target],
     remember: Option<&str>,
     tail: &str,
 ) -> (Option<String>, Vec<String>) {
     let rem = remember.map_or_else(String::new, |r| format!(" remember={r}"));
-    if items.len() == 1 {
-        return (None, vec![format!("{}{rem}{tail}", items[0])]);
+    if let [one] = targets {
+        return (
+            None,
+            vec![format!("{}{}{rem}{tail}", one.item, field_option(one))],
+        );
     }
+    let labels: Vec<String> = targets.iter().map(Target::label).collect();
     (
-        Some(format!("batch:{}{rem}{tail}", items.join(","))),
-        items.iter().map(|i| format!("{i}{tail}")).collect(),
+        Some(format!("batch:{}{rem}{tail}", labels.join(","))),
+        targets
+            .iter()
+            .map(|t| format!("{}{}{tail}", t.item, field_option(t)))
+            .collect(),
     )
 }
 
@@ -129,34 +150,35 @@ fn resolve(
     fetch: &mut Fetch<'_>,
 ) -> Result<(), Failure> {
     let mut parsed: Vec<(OsString, Vec<Part>)> = Vec::new();
-    let mut items: Vec<String> = Vec::new();
+    let mut targets: Vec<Target> = Vec::new();
     for (key, value) in env.iter() {
         let Some(v) = value.to_str() else { continue };
         let name = key.to_string_lossy();
         if let Some(parts) = refs::parse_value(v).map_err(|e| failure(format!("{name}: {e}")))? {
             for p in &parts {
                 if let Part::Ref(r) = p {
-                    if !items.contains(&r.item) {
-                        items.push(r.item.clone());
+                    let t = r.target();
+                    if !targets.iter().any(|x| same_target(x, &t)) {
+                        targets.push(t);
                     }
                 }
             }
             parsed.push((key.clone(), parts));
         }
     }
-    if items.is_empty() {
+    if targets.is_empty() {
         return Ok(());
     }
-    if items.len() > intent::MAX_BATCH {
+    if targets.len() > intent::MAX_BATCH {
         return Err(failure("at most 10 items per run"));
     }
-    let (batch, reads) = plan_domains(&items, remember, tail);
+    let (batch, reads) = plan_domains(&targets, remember, tail);
     if let Some(b) = batch {
         fetch(&b)?;
     }
-    let mut creds: HashMap<String, CredentialData> = HashMap::new();
-    for (item, domain) in items.iter().zip(reads) {
-        creds.insert(item.clone(), fetch(&domain)?);
+    let mut creds: Vec<CredentialData> = Vec::new();
+    for domain in reads {
+        creds.push(fetch(&domain)?);
     }
     for (key, parts) in parsed {
         let name = key.to_string_lossy().into_owned();
@@ -165,17 +187,15 @@ fn resolve(
             match p {
                 Part::Text(t) => out.push_str(t),
                 Part::Ref(r) => {
-                    let value =
-                        creds
-                            .get(&r.item)
-                            .and_then(|c| r.field.get(c))
-                            .ok_or_else(|| {
-                                failure(format!(
-                                    "{name}: bw://{} has no {}",
-                                    r.item,
-                                    r.field.name()
-                                ))
-                            })?;
+                    let t = r.target();
+                    let value = targets
+                        .iter()
+                        .position(|x| same_target(x, &t))
+                        .and_then(|i| creds.get(i))
+                        .and_then(|c| r.field.get(c))
+                        .ok_or_else(|| {
+                            failure(format!("{name}: bw://{} has no {}", r.item, r.field.name()))
+                        })?;
                     out.push_str(value);
                 }
             }
@@ -276,13 +296,30 @@ mod tests {
 
     #[test]
     fn domains() {
-        let one = vec!["a.com".to_string()];
+        let t = |item: &str, field: Option<&str>| Target {
+            item: item.into(),
+            field: field.map(String::from),
+        };
+        let one = vec![t("a.com", None)];
         assert_eq!(plan_domains(&one, None, ""), (None, vec!["a.com".into()]));
         assert_eq!(
             plan_domains(&one, Some("5m"), " | pi | r"),
             (None, vec!["a.com remember=5m | pi | r".into()])
         );
-        let three: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let keyed = vec![t("a.com", Some("K"))];
+        assert_eq!(
+            plan_domains(&keyed, Some("5m"), " | pi | r"),
+            (None, vec!["a.com field=K remember=5m | pi | r".into()])
+        );
+        let mixed = vec![t("a", None), t("b", Some("K"))];
+        assert_eq!(
+            plan_domains(&mixed, Some("5m"), " | pi | r"),
+            (
+                Some("batch:a,b#field:K remember=5m | pi | r".into()),
+                vec!["a | pi | r".into(), "b field=K | pi | r".into()]
+            )
+        );
+        let three: Vec<Target> = ["a", "b", "c"].map(|i| t(i, None)).to_vec();
         assert_eq!(
             plan_domains(&three, Some("5m"), " | pi | r"),
             (
@@ -319,6 +356,32 @@ mod tests {
         assert_eq!(e[OsStr::new("P")], "dbpw");
         assert_eq!(e[OsStr::new("URL")], "pg://dbu:otherpw@h");
         assert_eq!(e[OsStr::new("PLAIN")], "x");
+    }
+
+    #[test]
+    fn resolves_fields() {
+        let mut e = env(&[
+            ("U", "bw://db#username"),
+            ("K", "bw://db#field:TOKEN"),
+            ("K2", "bw://db#field:token"),
+        ]);
+        let mut seen: Vec<String> = Vec::new();
+        resolve(&mut e, None, "", &mut |d| {
+            seen.push(d.to_string());
+            Ok(if d == "db field=TOKEN" {
+                cred("tok", None)
+            } else {
+                cred("dbpw", Some("dbu"))
+            })
+        })
+        .expect("ok");
+        assert_eq!(
+            seen,
+            vec!["batch:db#field:TOKEN,db", "db field=TOKEN", "db"]
+        );
+        assert_eq!(e[OsStr::new("U")], "dbu");
+        assert_eq!(e[OsStr::new("K")], "tok");
+        assert_eq!(e[OsStr::new("K2")], "tok");
     }
 
     #[test]

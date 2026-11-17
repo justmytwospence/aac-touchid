@@ -161,6 +161,7 @@ aac-touchid run --env-file .env.agent --agent "pi · homelab" --reason "publish 
 |---|---|
 | `bw://ITEM` | The item's password. `ITEM` is a host, an item name or an item id, with no spaces or `# } , \| = $ {` (use the item id for such names). |
 | `bw://ITEM#FIELD` | `username`, `password`, `totp` (current code), `uri`, `domain` or `credential_id`. Notes are never released. |
+| `bw://ITEM#field:NAME` | The custom field `NAME` (see Custom fields). |
 | `${bw://ITEM#FIELD}` | The same, inside a longer value. |
 
 Options: `--env-file` (repeatable; later files win), `--agent` (default `$AAC_AGENT`), `--reason`, `--remember`, `--timeout` (seconds per answer, default 240). At most 10 items per run. Inherited environment variables may hold references too.

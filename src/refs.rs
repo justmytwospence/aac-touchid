@@ -1,8 +1,11 @@
 //! `bw://ITEM[#FIELD]` references in environment values, and .env files.
+//! FIELD is a built-in one, or `field:NAME` for a custom field.
 
 use ap_client::CredentialData;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::intent::{self, Target};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Field {
     Username,
     Password,
@@ -10,6 +13,8 @@ pub enum Field {
     Uri,
     Domain,
     CredentialId,
+    /// A custom field of the item, released in the password slot.
+    Custom(String),
 }
 
 impl Field {
@@ -25,7 +30,7 @@ impl Field {
         })
     }
 
-    pub fn get(self, c: &CredentialData) -> Option<&str> {
+    pub fn get<'a>(&self, c: &'a CredentialData) -> Option<&'a str> {
         match self {
             Self::Username => c.username.as_deref(),
             Self::Password => c.password.as_deref().map(String::as_str),
@@ -33,17 +38,19 @@ impl Field {
             Self::Uri => c.uri.as_deref(),
             Self::Domain => c.domain.as_deref(),
             Self::CredentialId => c.credential_id.as_deref(),
+            Self::Custom(_) => c.password.as_deref().map(String::as_str),
         }
     }
 
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> String {
         match self {
-            Self::Username => "username",
-            Self::Password => "password",
-            Self::Totp => "totp",
-            Self::Uri => "uri",
-            Self::Domain => "domain",
-            Self::CredentialId => "credential_id",
+            Self::Username => "username".into(),
+            Self::Password => "password".into(),
+            Self::Totp => "totp".into(),
+            Self::Uri => "uri".into(),
+            Self::Domain => "domain".into(),
+            Self::CredentialId => "credential_id".into(),
+            Self::Custom(n) => format!("field:{n}"),
         }
     }
 }
@@ -52,6 +59,19 @@ impl Field {
 pub struct Ref {
     pub item: String,
     pub field: Field,
+}
+
+impl Ref {
+    /// What one request has to fetch for this reference.
+    pub fn target(&self) -> Target {
+        Target {
+            item: self.item.clone(),
+            field: match &self.field {
+                Field::Custom(n) => Some(n.clone()),
+                _ => None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,11 +102,14 @@ pub fn parse_ref(s: &str) -> Result<Ref, String> {
     let field = match field {
         None => Field::Password,
         Some("notes") => return Err("notes are never released".to_string()),
-        Some(f) => Field::parse(f).ok_or_else(|| {
-            format!(
-                "unknown field \"{f}\" (use username, password, totp, uri, domain or credential_id)"
-            )
-        })?,
+        Some(f) => match f.strip_prefix("field:") {
+            Some(n) => Field::Custom(intent::parse_field(n).map_err(|e| e.to_string())?),
+            None => Field::parse(f).ok_or_else(|| {
+                format!(
+                    "unknown field \"{f}\" (use username, password, totp, uri, domain, credential_id or field:NAME)"
+                )
+            })?,
+        },
     };
     Ok(Ref {
         item: item.to_string(),
@@ -179,7 +202,20 @@ mod tests {
             parse_ref("bw://x#credential_id").map(|r| r.field),
             Ok(Field::CredentialId)
         );
+        assert_eq!(
+            parse_ref("bw://x#field:API_KEY").map(|r| r.field),
+            Ok(Field::Custom("API_KEY".into()))
+        );
+        assert_eq!(
+            parse_ref("bw://x#field:K").map(|r| r.target()),
+            Ok(Target {
+                item: "x".into(),
+                field: Some("K".into())
+            })
+        );
         for bad in [
+            "bw://x#field:",
+            "bw://x#field:a/b",
             "bw://x#notes",
             "bw://x#bogus",
             "bw://",
@@ -208,6 +244,13 @@ mod tests {
                 r("db", Field::Password),
                 Part::Text("@h/app".into()),
             ]
+        );
+        assert_eq!(
+            parse_value("t=${bw://x#field:T}"),
+            Ok(Some(vec![
+                Part::Text("t=".into()),
+                r("x", Field::Custom("T".into()))
+            ]))
         );
         assert!(parse_value("a ${bw://x").is_err());
         assert_eq!(parse_value("plain"), Ok(None));
