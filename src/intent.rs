@@ -6,6 +6,8 @@
 //! - `new:<name> [user=<u>] [url=<full url>] [words=3-20]` creates a login
 //!   with a generated six-word passphrase (`Violet-Shrug0-Broken-...`), or with
 //!   `[length=12-128] [symbols=no]` a random password.
+//! - `rotate:<item> [words=3-20] [length=12-128] [symbols=no]` replaces the
+//!   password of an existing login with a generated one.
 //! - `totp:<item> secret=<base32>` or `totp:<item> uri=otpauth://totp/...`
 //!   stores a 2FA seed on a login.
 //!
@@ -47,6 +49,7 @@ pub enum Intent {
     Batch(Batch),
     Create(NewLogin),
     AddTotp(AddTotp),
+    Rotate(Rotate),
     /// The device's own recent decisions, no sheet.
     Why,
 }
@@ -95,6 +98,13 @@ impl Generator {
             } => format!("{length}-character password without symbols"),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rotate {
+    /// A host, URL, item name or item id, resolved like a read.
+    pub item: String,
+    pub secret: Generator,
 }
 
 #[derive(PartialEq, Eq)]
@@ -149,7 +159,7 @@ impl fmt::Display for ParseError {
         f.write_str(match self {
             Self::MissingName => "new: needs a name",
             Self::BadName => "name must be 1-64 letters, digits, spaces or . - _ @ & + '",
-            Self::MissingItem => "totp: needs an item",
+            Self::MissingItem => "totp: and rotate: need an item",
             Self::BadItem => "item must be one word of at most 128 characters",
             Self::UnexpectedText => "unexpected text after the options",
             Self::UnknownOption => "unknown option",
@@ -182,6 +192,8 @@ pub fn parse(what: &str) -> Result<Intent, ParseError> {
         parse_new(rest).map(Intent::Create)
     } else if let Some(rest) = strip_prefix_ci(s, "totp:") {
         parse_totp(rest).map(Intent::AddTotp)
+    } else if let Some(rest) = strip_prefix_ci(s, "rotate:") {
+        parse_rotate(rest).map(Intent::Rotate)
     } else if let Some(rest) = strip_prefix_ci(s, "batch:") {
         parse_batch(rest).map(Intent::Batch)
     } else if let Some(rest) = strip_prefix_ci(s, "why:") {
@@ -340,8 +352,7 @@ fn split_words(rest: &str) -> Result<(Vec<&str>, Options<'_>), ParseError> {
     Ok((words, options))
 }
 
-fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
-    let (words, options) = split_words(rest)?;
+fn parse_name(words: &[&str]) -> Result<String, ParseError> {
     if words.is_empty() {
         return Err(ParseError::MissingName);
     }
@@ -353,46 +364,60 @@ fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
     {
         return Err(ParseError::BadName);
     }
-    let mut username = None;
-    let mut url = None;
-    let mut length = None;
-    let mut symbols = None;
-    let mut words = None;
-    for (key, value) in options {
-        let slot_taken = match key.to_ascii_lowercase().as_str() {
-            "user" => {
-                if value.is_empty() || value.len() > MAX_USER || value.chars().any(char::is_control)
-                {
-                    return Err(ParseError::BadUser);
-                }
-                username.replace(value.to_string()).is_some()
-            }
-            "url" => {
-                let scheme_ok = strip_prefix_ci(value, "https://")
-                    .or_else(|| strip_prefix_ci(value, "http://"))
-                    .is_some();
-                if !scheme_ok
-                    || value.len() > MAX_URL
-                    || value.chars().any(char::is_control)
-                    || host_of(value).is_none()
-                {
-                    return Err(ParseError::BadUrl);
-                }
-                url.replace(value.to_string()).is_some()
-            }
+    Ok(name)
+}
+
+fn parse_user(value: &str) -> Result<String, ParseError> {
+    if value.is_empty() || value.len() > MAX_USER || value.chars().any(char::is_control) {
+        return Err(ParseError::BadUser);
+    }
+    Ok(value.to_string())
+}
+
+fn parse_url(value: &str) -> Result<String, ParseError> {
+    let scheme_ok = strip_prefix_ci(value, "https://")
+        .or_else(|| strip_prefix_ci(value, "http://"))
+        .is_some();
+    if !scheme_ok
+        || value.len() > MAX_URL
+        || value.chars().any(char::is_control)
+        || host_of(value).is_none()
+    {
+        return Err(ParseError::BadUrl);
+    }
+    Ok(value.to_string())
+}
+
+/// `https://<name>` when the name looks like a host.
+fn default_uri(name: &str) -> Option<String> {
+    looks_like_host(name).then(|| format!("https://{}", name.to_ascii_lowercase()))
+}
+
+/// The password generator options: `length=`, `symbols=`, `words=`.
+#[derive(Default)]
+struct GenOptions {
+    length: Option<u32>,
+    symbols: Option<bool>,
+    words: Option<u32>,
+}
+
+impl GenOptions {
+    /// Take the option if it is a generator one: `Ok(true)` when it was.
+    fn take(&mut self, key: &str, value: &str) -> Result<bool, ParseError> {
+        let taken = match key.to_ascii_lowercase().as_str() {
             "length" => {
                 let n: u32 = value.parse().map_err(|_| ParseError::BadLength)?;
                 if !(MIN_LENGTH..=MAX_LENGTH).contains(&n) {
                     return Err(ParseError::BadLength);
                 }
-                length.replace(n).is_some()
+                self.length.replace(n).is_some()
             }
             "words" => {
                 let n: u32 = value.parse().map_err(|_| ParseError::BadWords)?;
                 if !(MIN_WORDS..=MAX_WORDS).contains(&n) {
                     return Err(ParseError::BadWords);
                 }
-                words.replace(n).is_some()
+                self.words.replace(n).is_some()
             }
             "symbols" => {
                 let on = match value.to_ascii_lowercase().as_str() {
@@ -400,34 +425,79 @@ fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
                     "no" => false,
                     _ => return Err(ParseError::BadSymbols),
                 };
-                symbols.replace(on).is_some()
+                self.symbols.replace(on).is_some()
             }
-            _ => return Err(ParseError::UnknownOption),
+            _ => return Ok(false),
+        };
+        if taken {
+            return Err(ParseError::DuplicateOption);
+        }
+        Ok(true)
+    }
+
+    fn finish(self) -> Result<Generator, ParseError> {
+        match (self.words, self.length, self.symbols) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(ParseError::MixedGenerators),
+            (None, None, None) => Ok(Generator::Passphrase {
+                words: DEFAULT_WORDS,
+            }),
+            (Some(words), _, _) => Ok(Generator::Passphrase { words }),
+            (None, length, symbols) => Ok(Generator::Password {
+                length: length.unwrap_or(DEFAULT_LENGTH),
+                symbols: symbols.unwrap_or(true),
+            }),
+        }
+    }
+}
+
+fn parse_new(rest: &str) -> Result<NewLogin, ParseError> {
+    let (words, options) = split_words(rest)?;
+    let name = parse_name(&words)?;
+    let mut username = None;
+    let mut url = None;
+    let mut generator = GenOptions::default();
+    for (key, value) in options {
+        let slot_taken = if generator.take(key, value)? {
+            false
+        } else {
+            match key.to_ascii_lowercase().as_str() {
+                "user" => username.replace(parse_user(value)?).is_some(),
+                "url" => url.replace(parse_url(value)?).is_some(),
+                _ => return Err(ParseError::UnknownOption),
+            }
         };
         if slot_taken {
             return Err(ParseError::DuplicateOption);
         }
     }
-    let uri = url.or_else(|| {
-        looks_like_host(&name).then(|| format!("https://{}", name.to_ascii_lowercase()))
-    });
+    let uri = url.or_else(|| default_uri(&name));
     Ok(NewLogin {
         name,
         username,
         uri,
-        secret: match (words, length, symbols) {
-            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
-                return Err(ParseError::MixedGenerators);
-            }
-            (None, None, None) => Generator::Passphrase {
-                words: DEFAULT_WORDS,
-            },
-            (Some(words), _, _) => Generator::Passphrase { words },
-            (None, length, symbols) => Generator::Password {
-                length: length.unwrap_or(DEFAULT_LENGTH),
-                symbols: symbols.unwrap_or(true),
-            },
-        },
+        secret: generator.finish()?,
+    })
+}
+
+fn parse_rotate(rest: &str) -> Result<Rotate, ParseError> {
+    let (words, options) = split_words(rest)?;
+    let item = match words.as_slice() {
+        [] => return Err(ParseError::MissingItem),
+        [item] => *item,
+        _ => return Err(ParseError::BadItem),
+    };
+    if item.len() > MAX_ITEM || item.chars().any(char::is_control) {
+        return Err(ParseError::BadItem);
+    }
+    let mut generator = GenOptions::default();
+    for (key, value) in options {
+        if !generator.take(key, value)? {
+            return Err(ParseError::UnknownOption);
+        }
+    }
+    Ok(Rotate {
+        item: item.to_string(),
+        secret: generator.finish()?,
     })
 }
 
@@ -565,6 +635,48 @@ mod tests {
         match parse(s) {
             Ok(Intent::AddTotp(t)) => t,
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn rotate(s: &str) -> Rotate {
+        match parse(s) {
+            Ok(Intent::Rotate(r)) => r,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rotate_defaults_and_options() {
+        let r = rotate("rotate:speedtest.example.com");
+        assert_eq!(r.item, "speedtest.example.com");
+        assert_eq!(r.secret, Generator::Passphrase { words: 6 });
+        assert_eq!(
+            rotate("rotate:x words=8").secret,
+            Generator::Passphrase { words: 8 }
+        );
+        assert_eq!(
+            rotate("rotate:x length=32 symbols=no").secret,
+            Generator::Password {
+                length: 32,
+                symbols: false
+            }
+        );
+        assert_eq!(rotate("ROTATE:x").item, "x");
+    }
+
+    #[test]
+    fn rotate_rejections() {
+        use ParseError::*;
+        for (input, err) in [
+            ("rotate:", MissingItem),
+            ("rotate:a b", BadItem),
+            ("rotate:x password64=YQ", UnknownOption),
+            ("rotate:x user=me", UnknownOption),
+            ("rotate:x words=5 length=20", MixedGenerators),
+            ("rotate:x words=4 words=5", DuplicateOption),
+            ("rotate:x length=5", BadLength),
+        ] {
+            assert_eq!(parse(input), Err(err), "{input}");
         }
     }
 

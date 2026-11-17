@@ -93,6 +93,16 @@ pub enum Conflict {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub enum PasswordWrite {
+    /// Stored. `history_kept` is whether the old password is now in the
+    /// item's password history.
+    Replaced {
+        history_kept: bool,
+    },
+    NotLogin,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum TotpWrite {
     Stored,
     /// The login has a seed already; it is never overwritten.
@@ -627,6 +637,47 @@ impl Vault {
         }
     }
 
+    /// Replace a login's password. Reads the item again first; the old
+    /// password is expected to move into the item's password history.
+    pub async fn set_password(&mut self, id: &str, new: &str) -> Result<PasswordWrite, String> {
+        let path = format!("/object/item/{}", pct(id));
+        let mut reply = self.call("GET", &path, None).await?;
+        let checked = self.check(&reply);
+        let mut item = reply["data"].take();
+        wipe(&mut reply);
+        if let Err(e) = checked {
+            wipe(&mut item);
+            return Err(e);
+        }
+        if item["type"].as_i64() != Some(1) || !item["login"].is_object() {
+            wipe(&mut item);
+            return Ok(PasswordWrite::NotLogin);
+        }
+        let old = item["login"]["password"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(|p| Zeroizing::new(p.to_string()));
+        item["login"]["password"] = Value::String(new.to_string());
+        let body = serde_json::to_vec(&item).map_err(|e| e.to_string());
+        wipe(&mut item);
+        let mut body = Zeroizing::new(body?);
+        let reply = self.call("PUT", &path, Some(&body)).await;
+        body.zeroize();
+        let mut reply = reply?;
+        let checked = self.check(&reply);
+        let stored = reply["data"]["login"]["password"].as_str() == Some(new);
+        let history_kept = old
+            .as_deref()
+            .is_none_or(|o| history_has(&reply["data"], o));
+        wipe(&mut reply);
+        checked?;
+        if stored {
+            Ok(PasswordWrite::Replaced { history_kept })
+        } else {
+            Err("bw did not store the new password".to_string())
+        }
+    }
+
     /// The current TOTP code of an item, never its seed.
     pub async fn totp_code(&mut self, id: &str) -> Option<String> {
         self.call("GET", &format!("/object/totp/{}", pct(id)), None)
@@ -767,6 +818,15 @@ fn matching_hosts(item: &Value) -> impl Iterator<Item = String> + '_ {
                 .is_none_or(|m| !NOT_A_HOST_MATCH.contains(&m))
         })
         .filter_map(|u| u["uri"].as_str().and_then(host_of))
+}
+
+/// Whether an item's password history holds this password.
+fn history_has(item: &Value, old: &str) -> bool {
+    item["passwordHistory"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|h| h["password"].as_str() == Some(old))
 }
 
 /// Which of a search's results to release.
@@ -953,6 +1013,20 @@ mod tests {
     }
 
     #[test]
+    fn history_detection() {
+        let with = serde_json::json!({
+            "passwordHistory": [{ "password": "old1" }, { "password": "old2" }]
+        });
+        assert!(history_has(&with, "old2"));
+        assert!(!history_has(&with, "other"));
+        assert!(!history_has(
+            &serde_json::json!({ "passwordHistory": null }),
+            "old1"
+        ));
+        assert!(!history_has(&serde_json::json!({}), "old1"));
+    }
+
+    #[test]
     fn duplicate_guard_matches_like_reads() {
         let host = "speedtest.example.com";
         let on = |item: Value| on_host(&item, host);
@@ -1132,7 +1206,11 @@ while True:
         out = {"success": True, "data": item}
     elif route.startswith("/object/item/") and method == "PUT":
         item = json.loads(body)
-        items[route.rsplit("/", 1)[1]] = item
+        key = route.rsplit("/", 1)[1]
+        old = items.get(key)
+        if old and old["login"]["password"] != item["login"]["password"]:
+            item["passwordHistory"] = [{"password": old["login"]["password"]}] + (old.get("passwordHistory") or [])
+        items[key] = item
         out = {"success": True, "data": item}
     elif route.startswith("/object/item/"):
         key = urllib.parse.unquote(route.rsplit("/", 1)[1])
@@ -1287,6 +1365,17 @@ while True:
             Resolved::Item(_)
         ));
         assert!(matches!(v.resolve("hub.com").await, Resolved::NotFound));
+        // Rotation keeps the old password in the item's history.
+        assert_eq!(
+            v.set_password("i1", "newpw").await,
+            Ok(PasswordWrite::Replaced { history_kept: true })
+        );
+        let Resolved::Item(github) = v.resolve("i1").await else {
+            panic!("github gone")
+        };
+        assert_eq!(github["login"]["password"], "newpw");
+        assert_eq!(github["passwordHistory"][0]["password"], "pw");
+        assert_eq!(github["login"]["totp"], "SEED", "PUT keeps the item");
 
         v.lock().await;
         assert!(!v.is_unlocked());

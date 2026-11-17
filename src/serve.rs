@@ -14,11 +14,13 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::bitwarden::{self, Conflict, Lookup, Resolved, TotpWrite, Vault, host_of, wipe};
+use crate::bitwarden::{
+    self, Conflict, Lookup, PasswordWrite, Resolved, TotpWrite, Vault, host_of, wipe,
+};
 use crate::control::{self, Decision, Envelope, Request, Response, Status};
 use crate::dialog;
 use crate::grants::{BATCH_WINDOW, Grant, Kind};
-use crate::intent::{self, AddTotp, Intent, NewLogin};
+use crate::intent::{self, AddTotp, Intent, NewLogin, Rotate};
 use crate::storage::{FileConnections, FileIdentity, short_hex};
 use crate::touchid::{self, Outcome};
 
@@ -312,6 +314,23 @@ pub fn create_reason(
         &format!("create a login with a {secret} and share it"),
         who,
         name,
+        username,
+        why,
+    )
+}
+
+/// `Bitwarden is trying to replace a password with a 6-word passphrase and share it`.
+pub fn rotate_reason(
+    who: &str,
+    item: &str,
+    username: Option<&str>,
+    secret: &str,
+    why: Option<&str>,
+) -> String {
+    sheet(
+        &format!("replace a password with a {secret} and share it"),
+        who,
+        item,
         username,
         why,
     )
@@ -639,6 +658,7 @@ impl Service {
                     Intent::Batch(b) => self.batch(p, b, reply).await,
                     Intent::Create(n) => self.create(p, n, reply).await,
                     Intent::AddTotp(t) => self.add_totp(p, t, reply).await,
+                    Intent::Rotate(r) => self.rotate(p, r, reply).await,
                     Intent::Why => self.why(p, reply),
                 }
             }
@@ -1024,34 +1044,126 @@ impl Service {
         );
     }
 
+    /// The one vault item a request names, found like a read finds it (a
+    /// host by its URI hosts, anything else by id or name). `None` means the
+    /// reason is already recorded and the request is to be denied.
+    async fn resolve_one(
+        &mut self,
+        p: &Pending,
+        what: &str,
+        search: &str,
+    ) -> Option<serde_json::Value> {
+        match self.vault.resolve(search).await {
+            Resolved::Item(v) => Some(v),
+            Resolved::Locked => {
+                self.lock("bw reported the vault locked").await;
+                self.record(&p.device, what, "denied (vault locked)");
+                None
+            }
+            Resolved::NotFound => {
+                self.record(&p.device, what, "not found");
+                None
+            }
+            Resolved::Ambiguous(n) => {
+                self.record(
+                    &p.device,
+                    what,
+                    &format!("ambiguous ({n} logins match; request by item id)"),
+                );
+                None
+            }
+            Resolved::Error(e) => {
+                self.vault_error(p, what, &e).await;
+                None
+            }
+        }
+    }
+
+    /// Replace an existing login's password with a generated one.
+    async fn rotate(&mut self, p: Pending, r: Rotate, reply: ReplyTx) {
+        let what = format!("rotate {}", r.item);
+        if !self.admit(&p, &what).await || !self.sync(&p, &what).await {
+            return deny(reply);
+        }
+        let Some(mut item) = self.resolve_one(&p, &what, &r.item).await else {
+            return deny(reply);
+        };
+        let id = item["id"].as_str().map(String::from);
+        let name = item["name"].as_str().map(String::from);
+        let username = item["login"]["username"].as_str().map(String::from);
+        let uri = item["login"]["uris"][0]["uri"].as_str().map(String::from);
+        let is_login = item["type"].as_i64() == Some(1) && item["login"].is_object();
+        wipe(&mut item);
+        let refusal = match &id {
+            _ if !is_login => Some("refused (not a login)"),
+            None => Some("refused (item has no id)"),
+            _ => None,
+        };
+        let (Some(id), None) = (id, refusal) else {
+            self.record(&p.device, &what, refusal.unwrap_or("refused"));
+            return deny(reply);
+        };
+        let shown = name.unwrap_or_else(|| r.item.clone());
+        let reason = rotate_reason(
+            &p.who,
+            &shown,
+            username.as_deref(),
+            &r.secret.describe(),
+            p.why.as_deref(),
+        );
+        if !self.approve(&p, &what, reason).await {
+            return deny(reply);
+        }
+        let written = async {
+            let password = self.vault.generate(r.secret).await?;
+            let write = self.vault.set_password(&id, &password).await?;
+            Ok::<_, String>((password, write))
+        }
+        .await;
+        match written {
+            Ok((password, PasswordWrite::Replaced { history_kept })) => {
+                self.after_write().await;
+                if history_kept {
+                    self.record(&p.recipient(), &what, "rotated");
+                } else {
+                    warn!("rotate: the old password is not in the item's history");
+                    self.record(
+                        &p.recipient(),
+                        &what,
+                        "rotated (old password not kept in history)",
+                    );
+                }
+                release(
+                    reply,
+                    CredentialData {
+                        username,
+                        password: Some(password),
+                        totp: None,
+                        uri,
+                        notes: None,
+                        credential_id: Some(id),
+                        domain: None,
+                    },
+                );
+            }
+            Ok((_, PasswordWrite::NotLogin)) => {
+                self.record(&p.device, &what, "refused (not a login)");
+                deny(reply);
+            }
+            Err(e) => {
+                self.vault_error(&p, &what, &e).await;
+                deny(reply);
+            }
+        }
+    }
+
     async fn add_totp(&mut self, p: Pending, t: AddTotp, reply: ReplyTx) {
         let what = format!("2FA {}", t.item);
         if !self.admit(&p, &what).await || !self.sync(&p, &what).await {
             return deny(reply);
         }
-        let mut item = match self.vault.resolve(&t.item).await {
-            Resolved::Item(v) => v,
-            Resolved::Locked => {
-                self.lock("bw reported the vault locked").await;
-                self.record(&p.device, &what, "denied (vault locked)");
-                return deny(reply);
-            }
-            Resolved::NotFound => {
-                self.record(&p.device, &what, "not found");
-                return deny(reply);
-            }
-            Resolved::Ambiguous(n) => {
-                self.record(
-                    &p.device,
-                    &what,
-                    &format!("ambiguous ({n} logins match; request by item id)"),
-                );
-                return deny(reply);
-            }
-            Resolved::Error(e) => {
-                self.vault_error(&p, &what, &e).await;
-                return deny(reply);
-            }
+        let Some(mut item) = self.resolve_one(&p, &what, &t.item).await else {
+            return deny(reply);
         };
         let id = item["id"].as_str().map(String::from);
         let name = item["name"].as_str().map(String::from);
@@ -1419,6 +1531,19 @@ mod tests {
             create_reason(&who, "Acme", None, "24-character password", None),
             format!(
                 "create a login with a 24-character password and share it\n\n{who}\n{}\nno reason given",
+                bold("Acme")
+            )
+        );
+        assert_eq!(
+            rotate_reason(
+                &who,
+                "Acme",
+                Some("bot"),
+                "6-word passphrase",
+                Some("rotate")
+            ),
+            format!(
+                "replace a password with a 6-word passphrase and share it\n\n{who}\n{} (bot)\nrotate",
                 bold("Acme")
             )
         );

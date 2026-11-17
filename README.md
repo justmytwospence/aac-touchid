@@ -51,11 +51,18 @@ aac run --domain "totp:acme.io secret=JBSWY3DPEHPK3PXP | pi · homelab | enroll 
 | Request | What it does |
 |---|---|
 | `new:<name> [user=<u>] [url=<full url>] [words=3-20]` | Creates a login named `<name>` with a passphrase from `bw`'s generator and releases username, password, URI and item id. The default is 6 capitalized words joined by `-`, one with a digit (`Violet-Shrug0-Broken-Lantern-Mosaic-Thirsty`); `words=` sets the count. For a random password instead, give `length=12-128` (default 24) and/or `symbols=no`; these cannot be combined with `words=`. If `<name>` looks like a host (`acme.io`), the URI defaults to `https://<name>`. |
+| `rotate:<item> [words=3-20] [length=12-128] [symbols=no]` | Replaces the password of an existing login with a generated one (the same formats as `new:`) and releases its username, new password, URI and item id. `<item>` is found like a read finds it: name the host you sign in on (`rotate:speedtest.example.com`), or use an item id. The old password stays in the item's password history. |
 | `totp:<item> secret=<base32>` | Stores a TOTP seed on a login and releases its username and current code, so the agent can confirm enrollment. |
 | `totp:<item> uri=otpauth://totp/...?secret=...` | The same, from an `otpauth://` URI; its other parameters (digits, period, algorithm) are kept. |
 | anything else | A normal read, unchanged. |
 
 `<name>` may have spaces and the characters `. - _ @ & + '`. `<item>` is one word: a domain, an item name without spaces, or an item id. Secrets are uppercased, `=` and `-` are dropped, and the rest must be base32 (A-Z, 2-7), 16-128 characters. Later reads use the normal flow (`--domain acme.io`).
+
+```sh
+# Change an existing login's password and use the new one.
+aac run --domain "rotate:speedtest.example.com | pi · homelab | rotate admin password" \
+  --env P=password -- ./set-password.sh
+```
 
 Each write shows its own Touch ID sheet. A new login's sheet names the password format (`6-word passphrase`, `32-character password`, `24-character password without symbols`), never the password:
 
@@ -65,13 +72,16 @@ Each write shows its own Touch ID sheet. A new login's sheet names the password 
 > **𝗮𝗰𝗺𝗲.𝗶𝗼** (bot@example.com)
 > sign up for Acme
 
+> Bitwarden is trying to replace a password with a 6-word passphrase and share it
+
 > Bitwarden is trying to add 2FA and share a 2FA code
 
 Guardrails:
 
-- `new:` is refused if an item with that name (any case) or a login for that host already exists, checked before the sheet and again after approval.
+- `new:` is refused if an item with that name (any case) or a login a read of that host would find (a URI on exactly that host, or named that host; `www.` ignored) already exists, checked before the sheet and again after approval.
 - Writes go straight to the Bitwarden server. The listener syncs its vault before a write's checks (refusing if that fails) and again after the write. Other Bitwarden apps pick up the change by their usual push notification or next sync.
 - New logins go in the folder `Agent-created` (created on first use), with a note naming the agent, device and reason.
+- `rotate:` works on any login that resolves to exactly one item, yours included, and only after its own sheet. The old password is never released; it stays in the item's password history, and the outcome says if it did not (`rotated (old password not kept in history)`).
 - `totp:` works only on a login that resolves to exactly one item, sits in `Agent-created`, and has no 2FA seed. An agent can never add 2FA to a login you made, and never overwrites a seed; the item is read again after approval to make sure.
 - `totp:` releases only the username and the current code, never the seed or the password.
 - Malformed requests are refused without a sheet: unknown or repeated options, more than one seed, HOTP (`otpauth://hotp/`), an `otpauth` URI without a secret, a length outside 12-128, a word count outside 3-20, or `words=` mixed with `length=`/`symbols=`. Error messages never repeat the request.
