@@ -728,7 +728,8 @@ impl Service {
         true
     }
 
-    /// Show the Touch ID sheet. A refusal is recorded and remembered.
+    /// Show the Touch ID sheet. A refusal is recorded and remembered;
+    /// Touch ID being unavailable is only recorded.
     async fn approve(&mut self, p: &Pending, what: &str, reason: String) -> bool {
         let outcome = touchid::confirm(reason, self.cfg.approval_timeout).await;
         self.last_activity = Instant::now();
@@ -736,7 +737,11 @@ impl Service {
             return true;
         }
         self.record(&p.device, what, &format!("{outcome:?}").to_lowercase());
-        self.quiet.note_denied(p.identity, what);
+        // Unavailable showed no sheet, so there is no prompt spam to hold off,
+        // and a retry should report the real reason again.
+        if outcome != Outcome::Unavailable {
+            self.quiet.note_denied(p.identity, what);
+        }
         false
     }
 
