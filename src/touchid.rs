@@ -43,7 +43,14 @@ mod imp {
         // SAFETY: plain LocalAuthentication calls on a context owned by this thread.
         unsafe {
             let ctx = LAContext::new();
-            if ctx.canEvaluatePolicy_error(policy).is_err() {
+            if let Err(e) = ctx.canEvaluatePolicy_error(policy) {
+                // -8 lockout (Mac password needed), -7 nothing enrolled,
+                // -6 no sensor, -11 no Watch nearby.
+                tracing::info!(
+                    "touch id unavailable (LAError {}: {})",
+                    e.code(),
+                    e.localizedDescription()
+                );
                 return Outcome::Unavailable;
             }
             // An empty fallback title hides the "Use Password" button.
