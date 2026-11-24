@@ -50,3 +50,22 @@ pub async fn ask(
     .ok()
     .flatten()
 }
+
+const NOTIFY: &str = r#"on run argv
+  display notification (item 1 of argv) with title "Bitwarden agent access" sound name "Glass"
+end run"#;
+
+/// Post a notification-center banner. Fire and forget.
+pub fn notify(message: String) {
+    tokio::spawn(async move {
+        let _ = tokio::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(NOTIFY)
+            .arg(message)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    });
+}

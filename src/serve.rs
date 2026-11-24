@@ -13,6 +13,7 @@ use ap_client::{
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 use crate::bitwarden::{
     self, Conflict, FieldWrite, Lookup, PasswordWrite, Resolved, TotpWrite, Vault, host_of, wipe,
@@ -21,13 +22,16 @@ use crate::control::{self, Decision, Envelope, Request, Response, Status};
 use crate::dialog;
 use crate::grants::{BATCH_WINDOW, Grant, Kind};
 use crate::intent::{self, AddTotp, Intent, NewLogin, Rotate, SaveLogin};
+use crate::panel::{self, Choice, Decision as PanelDecision, Prompt, Row};
 use crate::storage::{FileConnections, FileIdentity, short_hex};
-use crate::touchid::{self, Outcome};
+use crate::touchid;
 
 pub struct Config {
     pub proxy_url: String,
     pub lock_after: Duration,
     pub approval_timeout: Duration,
+    /// How long a request waits for a locked or closed Mac before it is refused.
+    pub wait_for_mac: Duration,
     /// Longest `remember=` window an agent can ask for; zero turns it off.
     pub max_remember: Duration,
     /// Machines whose `aac` this listener keeps paired.
@@ -43,6 +47,8 @@ const DENY_QUIET: Duration = Duration::from_secs(60);
 const UNLOCK_QUIET: Duration = Duration::from_secs(120);
 const UNLOCK_DIALOG_TIMEOUT: Duration = Duration::from_secs(90);
 const RECENT: usize = 50;
+/// How long a human has to type a value for `ask:`.
+const ASK_TIMEOUT: Duration = Duration::from_secs(180);
 /// `why:` reports decisions this recent, at most [`WHY_MAX`] of them.
 const WHY_WINDOW_SECS: u64 = 900;
 const WHY_MAX: usize = 5;
@@ -173,7 +179,10 @@ fn clean(s: &str, max: usize) -> Option<String> {
     let s: String = s
         .trim()
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+        })
         .take(max)
         .collect();
     (!s.is_empty()).then_some(s)
@@ -224,25 +233,6 @@ pub fn requester(agent: Option<&str>, device: &str) -> String {
     }
 }
 
-/// The sheet reads `Bitwarden is trying to share a password`, then one line
-/// each: who (bold), which item (bold), and why.
-pub fn credential_reason(
-    who: &str,
-    item: &str,
-    username: Option<&str>,
-    fields: &str,
-    why: Option<&str>,
-    remember: Option<Duration>,
-) -> String {
-    sheet(
-        &format!("share a {fields}{}", remember_suffix(remember)),
-        who,
-        item,
-        username,
-        why,
-    )
-}
-
 /// `1 min`, `1 h`, `1 h 30 min`.
 pub fn span(d: Duration) -> String {
     let m = d.as_secs() / 60;
@@ -255,43 +245,10 @@ pub fn span(d: Duration) -> String {
     }
 }
 
-fn remember_suffix(r: Option<Duration>) -> String {
-    r.map_or_else(String::new, |d| {
-        format!(", and again for {} without asking", span(d))
-    })
-}
-
 pub struct BatchLine {
     pub name: String,
     pub username: Option<String>,
     pub fields: String,
-}
-
-/// One sheet for several items: who, then one line per item, then why.
-pub fn batch_reason(
-    who: &str,
-    lines: &[BatchLine],
-    remember: Option<Duration>,
-    why: Option<&str>,
-) -> String {
-    let n = lines.len();
-    let items = lines
-        .iter()
-        .map(|l| {
-            let user = match l.username.as_deref() {
-                Some(u) if !u.is_empty() => format!(" ({u})"),
-                _ => String::new(),
-            };
-            format!("{}{user} \u{b7} {}", bold(&l.name), l.fields)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "share {n} login{}{}\n\n{who}\n{items}\n{}",
-        if n == 1 { "" } else { "s" },
-        remember_suffix(remember),
-        why.unwrap_or("no reason given")
-    )
 }
 
 fn with_text(q: &CredentialQuery, s: String) -> CredentialQuery {
@@ -300,54 +257,6 @@ fn with_text(q: &CredentialQuery, s: String) -> CredentialQuery {
         CredentialQuery::Id(_) => CredentialQuery::Id(s),
         CredentialQuery::Search(_) => CredentialQuery::Search(s),
     }
-}
-
-/// `Bitwarden is trying to create a login with a 6-word passphrase and share it`.
-pub fn create_reason(
-    who: &str,
-    name: &str,
-    username: Option<&str>,
-    secret: &str,
-    why: Option<&str>,
-) -> String {
-    sheet(
-        &format!("create a login with a {secret} and share it"),
-        who,
-        name,
-        username,
-        why,
-    )
-}
-
-/// `Bitwarden is trying to replace a password with a 6-word passphrase and share it`,
-/// or with `user=`: `..., set the username to bot@x.com, and share it`. The
-/// item line shows the username the login has now.
-pub fn rotate_reason(
-    who: &str,
-    item: &str,
-    username: Option<&str>,
-    new_username: Option<&str>,
-    secret: &str,
-    why: Option<&str>,
-) -> String {
-    let action = match new_username {
-        Some(u) => {
-            format!("replace a password with a {secret}, set the username to {u}, and share it")
-        }
-        None => format!("replace a password with a {secret} and share it"),
-    };
-    sheet(&action, who, item, username, why)
-}
-
-/// `Bitwarden is trying to save a password the agent supplied`.
-pub fn save_reason(who: &str, name: &str, username: Option<&str>, why: Option<&str>) -> String {
-    sheet(
-        "save a password the agent supplied",
-        who,
-        name,
-        username,
-        why,
-    )
 }
 
 /// What a `savefield:` is about to do, for its sheet.
@@ -361,50 +270,293 @@ pub enum FieldChange {
     Create,
 }
 
-/// `Bitwarden is trying to save the field “API_KEY” the agent supplied`, or
-/// to replace it (keeping the old value), or to create a login for it.
-pub fn save_field_reason(
-    who: &str,
+const NOTE: &str = "Agent and reason are the agent's own words. The device is verified by pairing.";
+
+fn row(label: &str, value: impl Into<String>) -> Row {
+    Row {
+        label: label.to_string(),
+        value: value.into(),
+    }
+}
+
+fn who_rows(p: &Pending) -> Vec<Row> {
+    vec![
+        row("Agent", p.agent.as_deref().unwrap_or("not given")),
+        row("Device", p.device.as_str()),
+    ]
+}
+
+fn why_row(p: &Pending) -> Row {
+    row("Reason", p.why.as_deref().unwrap_or("no reason given"))
+}
+
+fn item_rows(item: &str, username: Option<&str>) -> Vec<Row> {
+    let mut rows = vec![row("Item", item)];
+    if let Some(u) = username.filter(|u| !u.is_empty()) {
+        rows.push(row("Username", u));
+    }
+    rows
+}
+
+fn once(label: &str) -> (Vec<Choice>, Option<usize>) {
+    (
+        vec![Choice {
+            label: label.to_string(),
+            minutes: None,
+        }],
+        None,
+    )
+}
+
+/// Allow buttons for a read: once, 15 min and 1 h (up to the cap), plus the
+/// window the agent asked for, which Return presses.
+fn read_choices(remember: Option<Duration>, max: Duration) -> (Vec<Choice>, Option<usize>) {
+    let max_min = max.as_secs() / 60;
+    let mut minutes: Vec<u64> = [15u64, 60].into_iter().filter(|m| *m <= max_min).collect();
+    let asked = remember.map(|d| d.as_secs() / 60);
+    if let Some(m) = asked.filter(|m| !minutes.contains(m)) {
+        minutes.push(m);
+        minutes.sort_unstable();
+    }
+    let mut choices = vec![Choice {
+        label: "Allow once".to_string(),
+        minutes: None,
+    }];
+    choices.extend(minutes.iter().map(|m| Choice {
+        label: format!("Allow {}", span(Duration::from_secs(m * 60))),
+        minutes: Some(*m),
+    }));
+    let default = match asked {
+        Some(m) => choices.iter().position(|c| c.minutes == Some(m)),
+        None => Some(0),
+    };
+    (choices, default)
+}
+
+fn prompt(
+    title: String,
+    rows: Vec<Row>,
+    note: bool,
+    (choices, default_choice): (Vec<Choice>, Option<usize>),
+    touch_reason: String,
+    timeout: Duration,
+) -> Prompt {
+    Prompt {
+        title,
+        rows,
+        note: note.then(|| NOTE.to_string()),
+        choices,
+        default_choice,
+        touch_reason,
+        timeout_secs: timeout.as_secs(),
+        input: None,
+    }
+}
+
+fn read_prompt(
+    p: &Pending,
+    item: &str,
+    username: Option<&str>,
+    fields: &str,
+    remember: Option<Duration>,
+    max: Duration,
+    timeout: Duration,
+) -> Prompt {
+    let mut rows = who_rows(p);
+    rows.extend(item_rows(item, username));
+    rows.push(row("Releases", fields));
+    rows.push(why_row(p));
+    prompt(
+        format!("Share a {fields}"),
+        rows,
+        true,
+        read_choices(remember, max),
+        format!("share {item} with {}", p.device),
+        timeout,
+    )
+}
+
+fn batch_prompt(
+    p: &Pending,
+    lines: &[BatchLine],
+    remember: Option<Duration>,
+    max: Duration,
+    timeout: Duration,
+) -> Prompt {
+    let n = lines.len();
+    let mut rows = who_rows(p);
+    for (i, l) in lines.iter().enumerate() {
+        let user = match l.username.as_deref() {
+            Some(u) if !u.is_empty() => format!(" ({u})"),
+            _ => String::new(),
+        };
+        rows.push(row(
+            &format!("Item {}", i + 1),
+            format!("{}{user} \u{b7} {}", l.name, l.fields),
+        ));
+    }
+    rows.push(why_row(p));
+    let s = if n == 1 { "" } else { "s" };
+    prompt(
+        format!("Share {n} login{s}"),
+        rows,
+        true,
+        read_choices(remember, max),
+        format!("share {n} login{s} with {}", p.device),
+        timeout,
+    )
+}
+
+fn create_prompt(
+    p: &Pending,
+    name: &str,
+    username: Option<&str>,
+    secret: &str,
+    timeout: Duration,
+) -> Prompt {
+    let mut rows = who_rows(p);
+    rows.extend(item_rows(name, username));
+    rows.push(row("Password", format!("new {secret}")));
+    rows.push(why_row(p));
+    prompt(
+        "Create a login".to_string(),
+        rows,
+        true,
+        once("Create"),
+        format!("create the login {name}"),
+        timeout,
+    )
+}
+
+fn rotate_prompt(
+    p: &Pending,
+    item: &str,
+    username: Option<&str>,
+    new_username: Option<&str>,
+    secret: &str,
+    timeout: Duration,
+) -> Prompt {
+    let mut rows = who_rows(p);
+    rows.extend(item_rows(item, username));
+    rows.push(row("New password", secret));
+    if let Some(u) = new_username {
+        rows.push(row("New username", u));
+    }
+    rows.push(why_row(p));
+    prompt(
+        "Replace a password".to_string(),
+        rows,
+        true,
+        once("Replace"),
+        format!("replace the password of {item}"),
+        timeout,
+    )
+}
+
+fn save_prompt(p: &Pending, name: &str, username: Option<&str>, timeout: Duration) -> Prompt {
+    let mut rows = who_rows(p);
+    rows.extend(item_rows(name, username));
+    rows.push(why_row(p));
+    prompt(
+        "Save a password the agent supplied".to_string(),
+        rows,
+        true,
+        once("Save"),
+        format!("save the login {name}"),
+        timeout,
+    )
+}
+
+/// Who supplies a field's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The agent sent it (`savefield:`).
+    Agent,
+    /// The human types it on the panel (`ask:`).
+    Human,
+}
+
+fn field_prompt(
+    p: &Pending,
     item: &str,
     username: Option<&str>,
     field: &str,
     change: &FieldChange,
-    why: Option<&str>,
-) -> String {
-    let action = match change {
-        FieldChange::Add => format!("save the field \u{201c}{field}\u{201d} the agent supplied"),
-        FieldChange::Replace { archived } => format!(
-            "replace the field \u{201c}{field}\u{201d} with a value the agent supplied, keeping the old one as \u{201c}{archived}\u{201d}"
-        ),
-        FieldChange::Create => {
-            format!("create a login and save the field \u{201c}{field}\u{201d} the agent supplied")
+    by: Source,
+    timeout: Duration,
+) -> Prompt {
+    let f = field;
+    let title = match (change, by) {
+        (FieldChange::Add, Source::Agent) => {
+            format!("Save the field \u{201c}{f}\u{201d} the agent supplied")
+        }
+        (FieldChange::Replace { .. }, Source::Agent) => {
+            format!("Replace the field \u{201c}{f}\u{201d} with a value the agent supplied")
+        }
+        (FieldChange::Create, Source::Agent) => {
+            format!("Create a login holding the field \u{201c}{f}\u{201d} the agent supplied")
+        }
+        (FieldChange::Add, Source::Human) => {
+            format!("Enter a value for the field \u{201c}{f}\u{201d}")
+        }
+        (FieldChange::Replace { .. }, Source::Human) => {
+            format!("Enter a new value for the field \u{201c}{f}\u{201d}")
+        }
+        (FieldChange::Create, Source::Human) => {
+            format!("Create a login holding the field \u{201c}{f}\u{201d}")
         }
     };
-    sheet(&action, who, item, username, why)
+    let mut rows = who_rows(p);
+    rows.extend(item_rows(item, username));
+    if let FieldChange::Replace { archived } = change {
+        rows.push(row(
+            "Old value",
+            format!("kept as \u{201c}{archived}\u{201d}"),
+        ));
+    }
+    rows.push(why_row(p));
+    let mut pr = prompt(
+        title,
+        rows,
+        true,
+        once("Save"),
+        format!("save the field {field} on {item}"),
+        timeout,
+    );
+    if by == Source::Human {
+        pr.input = Some("Paste the value. The agent never sees it.".to_string());
+    }
+    pr
 }
 
-/// `Bitwarden is trying to add 2FA and share a 2FA code`.
-pub fn totp_reason(who: &str, item: &str, username: Option<&str>, why: Option<&str>) -> String {
-    sheet("add 2FA and share a 2FA code", who, item, username, why)
-}
-
-fn sheet(action: &str, who: &str, item: &str, username: Option<&str>, why: Option<&str>) -> String {
-    let user = match username {
-        Some(u) if !u.is_empty() => format!(" ({u})"),
-        _ => String::new(),
-    };
-    format!(
-        "{action}\n\n{who}\n{}{user}\n{}",
-        bold(item),
-        why.unwrap_or("no reason given")
+fn totp_prompt(p: &Pending, item: &str, username: Option<&str>, timeout: Duration) -> Prompt {
+    let mut rows = who_rows(p);
+    rows.extend(item_rows(item, username));
+    rows.push(why_row(p));
+    prompt(
+        "Add 2FA and share a 2FA code".to_string(),
+        rows,
+        true,
+        once("Add 2FA"),
+        format!("add 2FA to {item}"),
+        timeout,
     )
 }
 
-pub fn pairing_reason(device: &str, issued_secs_ago: u64) -> String {
-    format!(
-        "pair a new device\n\n{}\nfrom the pairing code issued {} ago",
-        bold(device),
-        ago(issued_secs_ago)
+fn pairing_prompt(device: &str, issued_secs_ago: u64, timeout: Duration) -> Prompt {
+    prompt(
+        "Pair a new device".to_string(),
+        vec![
+            row("Device", device),
+            row(
+                "Pairing code",
+                format!("issued {} ago", ago(issued_secs_ago)),
+            ),
+        ],
+        false,
+        once("Pair"),
+        format!("pair the device {device}"),
+        timeout,
     )
 }
 
@@ -494,6 +646,14 @@ impl Pending {
             .as_ref()
             .map_or(self.device.clone(), |a| format!("{a} ({})", self.device))
     }
+}
+
+/// What a human chose on the panel.
+struct Approval {
+    /// The window picked, if any.
+    minutes: Option<u64>,
+    /// A value typed on the panel (`ask:`).
+    value: Option<Zeroizing<String>>,
 }
 
 struct Service {
@@ -642,13 +802,19 @@ impl Service {
                     });
                     return;
                 };
-                let outcome = touchid::confirm(
-                    pairing_reason(&name, issued.elapsed().as_secs()),
+                let decision = panel::ask(&pairing_prompt(
+                    &name,
+                    issued.elapsed().as_secs(),
                     self.cfg.approval_timeout,
-                )
+                ))
                 .await;
-                let approved = outcome == Outcome::Approved;
-                self.record(&name, "pairing", &format!("{outcome:?}").to_lowercase());
+                let (approved, outcome) = match decision {
+                    PanelDecision::Approved { .. } => (true, "approved"),
+                    PanelDecision::Denied => (false, "denied"),
+                    PanelDecision::TimedOut => (false, "timedout"),
+                    PanelDecision::Unavailable => (false, "unavailable"),
+                };
+                self.record(&name, "pairing", outcome);
                 let _ = reply.send(FingerprintVerificationReply {
                     approved,
                     name: approved.then_some(name),
@@ -707,6 +873,7 @@ impl Service {
                     Intent::AddTotp(t) => self.add_totp(p, t, reply).await,
                     Intent::Save(n) => self.save(p, n, reply).await,
                     Intent::SaveField(f) => self.save_field(p, f, reply).await,
+                    Intent::AskValue(a) => self.ask_value(p, a, reply).await,
                     Intent::Rotate(r) => self.rotate(p, r, reply).await,
                     Intent::Why => self.why(p, reply),
                 }
@@ -720,6 +887,10 @@ impl Service {
             self.record(&p.device, what, "denied (repeat within 60 s)");
             return false;
         }
+        // Never show the master-password dialog to a locked screen.
+        if !self.vault.is_unlocked() && !self.wait_for_mac(p, what).await {
+            return false;
+        }
         if !self.ensure_unlocked(&p.who, what, p.why.as_deref()).await {
             self.record(&p.device, what, "denied (vault locked)");
             self.quiet.note_denied(p.identity, what);
@@ -728,21 +899,59 @@ impl Service {
         true
     }
 
-    /// Show the Touch ID sheet. A refusal is recorded and remembered;
-    /// Touch ID being unavailable is only recorded.
-    async fn approve(&mut self, p: &Pending, what: &str, reason: String) -> bool {
-        let outcome = touchid::confirm(reason, self.cfg.approval_timeout).await;
-        self.last_activity = Instant::now();
-        if outcome == Outcome::Approved {
+    /// Wait (up to `wait_for_mac`) until a panel can be shown: the screen
+    /// unlocked and Touch ID usable. Posts one notification while waiting.
+    async fn wait_for_mac(&mut self, p: &Pending, what: &str) -> bool {
+        let ready = || !touchid::screen_locked() && touchid::available();
+        if ready() {
             return true;
         }
-        self.record(&p.device, what, &format!("{outcome:?}").to_lowercase());
-        // Unavailable showed no sheet, so there is no prompt spam to hold off,
+        info!("waiting for the Mac: {what} from {}", p.device);
+        dialog::notify(format!(
+            "An agent request from {} is waiting. Unlock this Mac to answer it.",
+            p.device
+        ));
+        let until = Instant::now() + self.cfg.wait_for_mac;
+        while Instant::now() < until {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if ready() {
+                return true;
+            }
+        }
+        self.record(
+            &p.device,
+            what,
+            "unavailable (Mac locked, asleep or lid closed)",
+        );
+        false
+    }
+
+    /// Show the approval panel (then Touch ID). A refusal is recorded and
+    /// remembered; the Mac being unavailable is only recorded.
+    async fn approve(&mut self, p: &Pending, what: &str, prompt: Prompt) -> Option<Approval> {
+        if !self.wait_for_mac(p, what).await {
+            return None;
+        }
+        let decision = panel::ask(&prompt).await;
+        self.last_activity = Instant::now();
+        let outcome = match decision {
+            PanelDecision::Approved { choice, value } => {
+                return Some(Approval {
+                    minutes: prompt.choices.get(choice).and_then(|c| c.minutes),
+                    value: value.map(Zeroizing::new),
+                });
+            }
+            PanelDecision::Denied => "denied",
+            PanelDecision::TimedOut => "timedout",
+            PanelDecision::Unavailable => "unavailable",
+        };
+        self.record(&p.device, what, outcome);
+        // Unavailable showed no panel, so there is no prompt spam to hold off,
         // and a retry should report the real reason again.
-        if outcome != Outcome::Unavailable {
+        if outcome != "unavailable" {
             self.quiet.note_denied(p.identity, what);
         }
-        false
+        None
     }
 
     /// Sync before a write's checks. Records and refuses on failure, since
@@ -852,18 +1061,20 @@ impl Service {
             .clone()
             .unwrap_or_else(|| query.search_string().to_string());
         let item = item_name.unwrap_or(domain);
-        let reason = credential_reason(
-            &p.who,
+        let prompt = read_prompt(
+            &p,
             &item,
             credential.username.as_deref(),
             &fields.describe(),
-            p.why.as_deref(),
             remember,
+            self.cfg.max_remember,
+            self.cfg.approval_timeout,
         );
-        if !self.approve(&p, &what, reason).await {
+        let Some(approval) = self.approve(&p, &what, prompt).await else {
             return deny(reply);
-        }
-        if let (Some(d), Some(id)) = (remember, credential.credential_id.clone()) {
+        };
+        let window = approval.minutes.map(|m| Duration::from_secs(m * 60));
+        if let (Some(d), Some(id)) = (window, credential.credential_id.clone()) {
             shared(&self.shared).grants.add(Grant {
                 device: p.identity,
                 device_label: p.device.clone(),
@@ -875,7 +1086,11 @@ impl Service {
                 uses_left: None,
             });
         }
-        self.record(&p.recipient(), &what, "approved");
+        let outcome = match window {
+            Some(d) => format!("approved (remembered {})", span(d)),
+            None => "approved".to_string(),
+        };
+        self.record(&p.recipient(), &what, &outcome);
         release(reply, *credential);
     }
 
@@ -989,16 +1204,23 @@ impl Service {
                 fields: l.fields.clone(),
             })
             .collect();
-        let reason = batch_reason(&p.who, &lines, remember, p.why.as_deref());
-        if !self.approve(&p, &what, reason).await {
+        let prompt = batch_prompt(
+            &p,
+            &lines,
+            remember,
+            self.cfg.max_remember,
+            self.cfg.approval_timeout,
+        );
+        let Some(approval) = self.approve(&p, &what, prompt).await else {
             return deny(reply);
-        }
+        };
+        let window = approval.minutes.map(|m| Duration::from_secs(m * 60));
         let now = Instant::now();
         let n = found.len();
         {
             let mut s = shared(&self.shared);
             for (id, field, line) in found {
-                let (kind, expires, uses_left) = match remember {
+                let (kind, expires, uses_left) = match window {
                     Some(d) => (Kind::Remembered, now + d, None),
                     None => (Kind::Batch, now + BATCH_WINDOW, Some(1)),
                 };
@@ -1014,7 +1236,11 @@ impl Service {
                 });
             }
         }
-        self.record(&p.recipient(), &what, "approved (batch)");
+        let outcome = match window {
+            Some(d) => format!("approved (batch, remembered {})", span(d)),
+            None => "approved (batch)".to_string(),
+        };
+        self.record(&p.recipient(), &what, &outcome);
         release(
             reply,
             CredentialData {
@@ -1059,14 +1285,14 @@ impl Service {
         {
             return deny(reply);
         }
-        let reason = create_reason(
-            &p.who,
+        let prompt = create_prompt(
+            &p,
             &n.name,
             n.username.as_deref(),
             &n.secret.describe(),
-            p.why.as_deref(),
+            self.cfg.approval_timeout,
         );
-        if !self.approve(&p, &what, reason).await
+        if self.approve(&p, &what, prompt).await.is_none()
             || !self.may_create(&p, &what, &n.name, n.uri.as_deref()).await
         {
             return deny(reply);
@@ -1152,8 +1378,13 @@ impl Service {
         {
             return deny(reply);
         }
-        let reason = save_reason(&p.who, &n.name, n.username.as_deref(), p.why.as_deref());
-        if !self.approve(&p, &what, reason).await
+        let prompt = save_prompt(
+            &p,
+            &n.name,
+            n.username.as_deref(),
+            self.cfg.approval_timeout,
+        );
+        if self.approve(&p, &what, prompt).await.is_none()
             || !self.may_create(&p, &what, &n.name, n.uri.as_deref()).await
         {
             return deny(reply);
@@ -1305,61 +1536,21 @@ impl Service {
                     ),
                 };
                 let shown = name.unwrap_or_else(|| f.item.clone());
-                let reason = save_field_reason(
-                    &p.who,
+                let prompt = field_prompt(
+                    &p,
                     &shown,
                     username.as_deref(),
                     &field_shown,
                     &change,
-                    p.why.as_deref(),
+                    Source::Agent,
+                    self.cfg.approval_timeout,
                 );
-                if !self.approve(&p, &what, reason).await {
+                if self.approve(&p, &what, prompt).await.is_none() {
                     return deny(reply);
                 }
-                match self.vault.set_field(&id, &f.name, &f.value, &date).await {
-                    Ok(write @ (FieldWrite::Added | FieldWrite::Replaced { .. })) => {
-                        self.after_write().await;
-                        let outcome = match write {
-                            FieldWrite::Replaced { archived } => format!(
-                                "field replaced (old value kept as \u{201c}{archived}\u{201d})"
-                            ),
-                            _ => "field saved".to_string(),
-                        };
-                        self.record(&p.recipient(), &what, &outcome);
-                        release(
-                            reply,
-                            CredentialData {
-                                username,
-                                password: None,
-                                totp: None,
-                                uri,
-                                notes: None,
-                                credential_id: Some(id),
-                                domain: None,
-                            },
-                        );
-                    }
-                    Ok(FieldWrite::Unchanged) => {
-                        self.record(&p.recipient(), &what, "unchanged");
-                        deny(reply);
-                    }
-                    Ok(FieldWrite::Ambiguous(n)) => {
-                        self.record(
-                            &p.device,
-                            &what,
-                            &format!("refused ({n} fields named {})", f.name),
-                        );
-                        deny(reply);
-                    }
-                    Ok(FieldWrite::Linked) => {
-                        self.record(&p.device, &what, "refused (field is linked)");
-                        deny(reply);
-                    }
-                    Err(e) => {
-                        self.vault_error(&p, &what, &e).await;
-                        deny(reply);
-                    }
-                }
+                let write = self.vault.set_field(&id, &f.name, &f.value, &date).await;
+                self.field_written(&p, &what, &f.name, write, id, username, uri, reply)
+                    .await;
             }
             Resolved::NotFound => self.save_field_new(p, f, &what, reply).await,
             Resolved::Locked => {
@@ -1399,19 +1590,103 @@ impl Service {
         if !self.may_create(&p, what, &login_name, uri.as_deref()).await {
             return deny(reply);
         }
-        let reason = save_field_reason(
-            &p.who,
+        let prompt = field_prompt(
+            &p,
             &login_name,
             f.username.as_deref(),
             &f.name,
             &FieldChange::Create,
-            p.why.as_deref(),
+            Source::Agent,
+            self.cfg.approval_timeout,
         );
-        if !self.approve(&p, what, reason).await
+        if self.approve(&p, what, prompt).await.is_none()
             || !self.may_create(&p, what, &login_name, uri.as_deref()).await
         {
             return deny(reply);
         }
+        self.field_login_created(
+            &p,
+            what,
+            &login_name,
+            f.username,
+            uri,
+            (&f.name, &f.value),
+            reply,
+        )
+        .await;
+    }
+
+    /// Report the result of writing a field to an existing item.
+    #[allow(clippy::too_many_arguments)]
+    async fn field_written(
+        &mut self,
+        p: &Pending,
+        what: &str,
+        name: &str,
+        write: Result<FieldWrite, String>,
+        id: String,
+        username: Option<String>,
+        uri: Option<String>,
+        reply: ReplyTx,
+    ) {
+        match write {
+            Ok(write @ (FieldWrite::Added | FieldWrite::Replaced { .. })) => {
+                self.after_write().await;
+                let outcome = match write {
+                    FieldWrite::Replaced { archived } => {
+                        format!("field replaced (old value kept as \u{201c}{archived}\u{201d})")
+                    }
+                    _ => "field saved".to_string(),
+                };
+                self.record(&p.recipient(), what, &outcome);
+                release(
+                    reply,
+                    CredentialData {
+                        username,
+                        password: None,
+                        totp: None,
+                        uri,
+                        notes: None,
+                        credential_id: Some(id),
+                        domain: None,
+                    },
+                );
+            }
+            Ok(FieldWrite::Unchanged) => {
+                self.record(&p.recipient(), what, "unchanged");
+                deny(reply);
+            }
+            Ok(FieldWrite::Ambiguous(n)) => {
+                self.record(
+                    &p.device,
+                    what,
+                    &format!("refused ({n} fields named {name})"),
+                );
+                deny(reply);
+            }
+            Ok(FieldWrite::Linked) => {
+                self.record(&p.device, what, "refused (field is linked)");
+                deny(reply);
+            }
+            Err(e) => {
+                self.vault_error(p, what, &e).await;
+                deny(reply);
+            }
+        }
+    }
+
+    /// Create a login in `Agent-created` that holds one hidden field, and report it.
+    #[allow(clippy::too_many_arguments)]
+    async fn field_login_created(
+        &mut self,
+        p: &Pending,
+        what: &str,
+        login_name: &str,
+        username: Option<String>,
+        uri: Option<String>,
+        field: (&str, &str),
+        reply: ReplyTx,
+    ) {
         let written = async {
             let folder = self
                 .vault
@@ -1426,10 +1701,10 @@ impl Service {
             );
             self.vault
                 .create_login(&bitwarden::NewLogin {
-                    name: &login_name,
-                    username: f.username.as_deref(),
+                    name: login_name,
+                    username: username.as_deref(),
                     password: None,
-                    field: Some((&f.name, &f.value)),
+                    field: Some(field),
                     uri: uri.as_deref(),
                     folder_id: &folder,
                     notes: &notes,
@@ -1444,7 +1719,7 @@ impl Service {
                 release(
                     reply,
                     CredentialData {
-                        username: f.username,
+                        username,
                         password: None,
                         totp: None,
                         uri,
@@ -1455,10 +1730,156 @@ impl Service {
                 );
             }
             Err(e) => {
-                self.vault_error(&p, what, &e).await;
+                self.vault_error(p, what, &e).await;
                 deny(reply);
             }
         }
+    }
+
+    /// `ask:` stores a value the human types on the panel as a hidden field
+    /// of an item (or of a new login). The agent never sees the value.
+    async fn ask_value(&mut self, p: Pending, a: intent::AskValue, reply: ReplyTx) {
+        let what = format!("ask {} {}", a.item, a.name);
+        if !self.admit(&p, &what).await || !self.sync(&p, &what).await {
+            return deny(reply);
+        }
+        let date = bitwarden::utc_date(now_secs());
+        match self.vault.resolve(&a.item).await {
+            Resolved::Item(mut item) => {
+                let id = item["id"].as_str().map(String::from);
+                let name = item["name"].as_str().map(String::from);
+                let username = item["login"]["username"]
+                    .as_str()
+                    .filter(|u| !u.is_empty())
+                    .map(String::from);
+                let uri = item["login"]["uris"][0]["uri"].as_str().map(String::from);
+                // The sentinel never equals a stored value, so `Same` cannot occur.
+                let state = bitwarden::field_state(&item, &a.name, "\u{0}");
+                wipe(&mut item);
+                let Some(id) = id else {
+                    self.record(&p.device, &what, "refused (item has no id)");
+                    return deny(reply);
+                };
+                let (change, field_shown) = match state {
+                    bitwarden::FieldState::Ambiguous(n) => {
+                        self.record(
+                            &p.device,
+                            &what,
+                            &format!("refused ({n} fields named {})", a.name),
+                        );
+                        return deny(reply);
+                    }
+                    bitwarden::FieldState::Linked => {
+                        self.record(&p.device, &what, "refused (field is linked)");
+                        return deny(reply);
+                    }
+                    bitwarden::FieldState::Present { vault_name } => (
+                        FieldChange::Replace {
+                            archived: format!("{vault_name} (replaced {date})"),
+                        },
+                        vault_name,
+                    ),
+                    _ => (FieldChange::Add, a.name.clone()),
+                };
+                let shown = name.unwrap_or_else(|| a.item.clone());
+                let prompt = field_prompt(
+                    &p,
+                    &shown,
+                    username.as_deref(),
+                    &field_shown,
+                    &change,
+                    Source::Human,
+                    ASK_TIMEOUT,
+                );
+                let Some(value) = self.typed_value(&p, &what, prompt).await else {
+                    return deny(reply);
+                };
+                let write = self.vault.set_field(&id, &a.name, &value, &date).await;
+                self.field_written(&p, &what, &a.name, write, id, username, uri, reply)
+                    .await;
+            }
+            Resolved::NotFound => {
+                let Some(login_name) = intent::new_login_name(&a.item) else {
+                    self.record(&p.device, &what, "not found");
+                    return deny(reply);
+                };
+                let uri = a.uri.clone().or_else(|| intent::new_login_uri(&a.item));
+                if !self
+                    .may_create(&p, &what, &login_name, uri.as_deref())
+                    .await
+                {
+                    return deny(reply);
+                }
+                let prompt = field_prompt(
+                    &p,
+                    &login_name,
+                    a.username.as_deref(),
+                    &a.name,
+                    &FieldChange::Create,
+                    Source::Human,
+                    ASK_TIMEOUT,
+                );
+                let Some(value) = self.typed_value(&p, &what, prompt).await else {
+                    return deny(reply);
+                };
+                if !self
+                    .may_create(&p, &what, &login_name, uri.as_deref())
+                    .await
+                {
+                    return deny(reply);
+                }
+                self.field_login_created(
+                    &p,
+                    &what,
+                    &login_name,
+                    a.username,
+                    uri,
+                    (&a.name, &value),
+                    reply,
+                )
+                .await;
+            }
+            Resolved::Locked => {
+                self.lock("bw reported the vault locked").await;
+                self.record(&p.device, &what, "denied (vault locked)");
+                deny(reply);
+            }
+            Resolved::Ambiguous(n) => {
+                self.record(
+                    &p.device,
+                    &what,
+                    &format!("ambiguous ({n} logins match; request by item id)"),
+                );
+                deny(reply);
+            }
+            Resolved::Error(e) => {
+                self.vault_error(&p, &what, &e).await;
+                deny(reply);
+            }
+        }
+    }
+
+    /// Show a panel with a value field and return what the human typed, if
+    /// they approved and it is storable.
+    async fn typed_value(
+        &mut self,
+        p: &Pending,
+        what: &str,
+        prompt: Prompt,
+    ) -> Option<Zeroizing<String>> {
+        let approval = self.approve(p, what, prompt).await?;
+        let value = approval
+            .value
+            .map(|v| Zeroizing::new(v.trim().to_string()))?;
+        if !intent::valid_field_value(&value) {
+            self.record(
+                &p.device,
+                what,
+                "refused (value must be 1-4096 characters without control characters)",
+            );
+            return None;
+        }
+        Some(value)
     }
 
     /// Replace an existing login's password with a generated one.
@@ -1491,15 +1912,15 @@ impl Service {
             return deny(reply);
         };
         let shown = name.unwrap_or_else(|| r.item.clone());
-        let reason = rotate_reason(
-            &p.who,
+        let prompt = rotate_prompt(
+            &p,
             &shown,
             username.as_deref(),
             new_username.as_deref(),
             &r.secret.describe(),
-            p.why.as_deref(),
+            self.cfg.approval_timeout,
         );
-        if !self.approve(&p, &what, reason).await {
+        if self.approve(&p, &what, prompt).await.is_none() {
             return deny(reply);
         }
         let written = async {
@@ -1582,8 +2003,8 @@ impl Service {
             return deny(reply);
         };
         let shown = name.unwrap_or_else(|| t.item.clone());
-        let reason = totp_reason(&p.who, &shown, username.as_deref(), p.why.as_deref());
-        if !self.approve(&p, &what, reason).await {
+        let prompt = totp_prompt(&p, &shown, username.as_deref(), self.cfg.approval_timeout);
+        if self.approve(&p, &what, prompt).await.is_none() {
             return deny(reply);
         }
         match self.vault.set_totp(&id, &t.seed).await {
@@ -1880,105 +2301,6 @@ mod tests {
     use ap_proxy_protocol::IdentityKeyPair;
 
     #[test]
-    fn sheet_texts() {
-        let who = requester(Some("pi \u{b7} homelab"), "nuc");
-        assert_eq!(who, format!("{} (nuc)", bold("pi \u{b7} homelab")));
-        assert_eq!(requester(None, "nuc"), bold("nuc"));
-        assert_eq!(
-            credential_reason(
-                &who,
-                "GitHub",
-                Some("me@x.com"),
-                "password + 2FA code",
-                Some("log in with gh"),
-                None
-            ),
-            format!(
-                "share a password + 2FA code\n\n{who}\n{} (me@x.com)\nlog in with gh",
-                bold("GitHub")
-            )
-        );
-        assert_eq!(
-            credential_reason("n", "x", None, "password", None, None),
-            "share a password\n\nn\n\u{1D605}\nno reason given"
-        );
-        assert_eq!(
-            pairing_reason("nuc", 75),
-            format!(
-                "pair a new device\n\n{}\nfrom the pairing code issued 1 min ago",
-                bold("nuc")
-            )
-        );
-    }
-
-    #[test]
-    fn write_sheet_texts() {
-        let who = requester(Some("pi"), "nuc");
-        assert_eq!(
-            create_reason(
-                &who,
-                "acme.io",
-                Some("bot@x.com"),
-                "6-word passphrase",
-                Some("sign up")
-            ),
-            format!(
-                "create a login with a 6-word passphrase and share it\n\n{who}\n{} (bot@x.com)\nsign up",
-                bold("acme.io")
-            )
-        );
-        assert_eq!(
-            create_reason(&who, "Acme", None, "24-character password", None),
-            format!(
-                "create a login with a 24-character password and share it\n\n{who}\n{}\nno reason given",
-                bold("Acme")
-            )
-        );
-        assert_eq!(
-            rotate_reason(
-                &who,
-                "Acme",
-                Some("bot"),
-                None,
-                "6-word passphrase",
-                Some("rotate")
-            ),
-            format!(
-                "replace a password with a 6-word passphrase and share it\n\n{who}\n{} (bot)\nrotate",
-                bold("Acme")
-            )
-        );
-        assert_eq!(
-            rotate_reason(
-                &who,
-                "Speedtest",
-                None,
-                Some("st@x.com"),
-                "6-word passphrase",
-                None
-            ),
-            format!(
-                "replace a password with a 6-word passphrase, set the username to st@x.com, and share it\n\n{who}\n{}\nno reason given",
-                bold("Speedtest")
-            )
-        );
-        assert_eq!(
-            save_reason(&who, "Acme", Some("bot"), Some("store login")),
-            format!(
-                "save a password the agent supplied\n\n{who}\n{} (bot)\nstore login",
-                bold("Acme")
-            )
-        );
-        assert_eq!(
-            totp_reason(&who, "Acme", Some("bot"), Some("enroll 2FA")),
-            format!(
-                "add 2FA and share a 2FA code\n\n{who}\n{} (bot)\nenroll 2FA",
-                bold("Acme")
-            )
-        );
-    }
-
-    #[test]
     fn recent_for_filters_by_device_and_age() {
         let d = |at: u64, device: &str, query: &str, outcome: &str| Decision {
             at,
@@ -2123,22 +2445,92 @@ mod tests {
         assert_eq!(query_label(&CredentialQuery::Id("abc".into())), "item abc");
     }
 
+    fn pending(agent: Option<&str>, why: Option<&str>) -> Pending {
+        Pending {
+            identity: IdentityKeyPair::generate().identity().fingerprint(),
+            device: "nuc".into(),
+            who: requester(agent, "nuc"),
+            agent: agent.map(String::from),
+            why: why.map(String::from),
+        }
+    }
+
+    fn mins(d: u64) -> Option<Duration> {
+        Some(Duration::from_secs(d * 60))
+    }
+
+    fn labels(c: &[Choice]) -> Vec<&str> {
+        c.iter().map(|c| c.label.as_str()).collect()
+    }
+
     #[test]
-    fn remember_and_batch_sheets() {
-        assert_eq!(span(Duration::from_secs(60)), "1 min");
-        assert_eq!(span(Duration::from_secs(3600)), "1 h");
-        assert_eq!(span(Duration::from_secs(5400)), "1 h 30 min");
-        assert!(
-            credential_reason(
-                "w",
-                "x",
-                None,
-                "password",
-                None,
-                Some(Duration::from_secs(900))
-            )
-            .starts_with("share a password, and again for 15 min without asking\n\n")
+    fn read_choices_offer_and_preselect() {
+        let (c, d) = read_choices(None, Duration::from_secs(3600));
+        assert_eq!(labels(&c), ["Allow once", "Allow 15 min", "Allow 1 h"]);
+        assert_eq!(d, Some(0));
+        let (c, d) = read_choices(mins(15), Duration::from_secs(3600));
+        assert_eq!(labels(&c), ["Allow once", "Allow 15 min", "Allow 1 h"]);
+        assert_eq!(d, Some(1));
+        let (c, d) = read_choices(mins(30), Duration::from_secs(3600));
+        assert_eq!(
+            labels(&c),
+            ["Allow once", "Allow 15 min", "Allow 30 min", "Allow 1 h"]
         );
+        assert_eq!(d, Some(2));
+        let (c, _) = read_choices(None, Duration::ZERO);
+        assert_eq!(labels(&c), ["Allow once"]);
+        let (c, d) = read_choices(mins(10), Duration::from_secs(600));
+        assert_eq!(labels(&c), ["Allow once", "Allow 10 min"]);
+        assert_eq!(d, Some(1));
+    }
+
+    #[test]
+    fn read_prompt_rows() {
+        let t = Duration::from_secs(60);
+        let p = pending(Some("pi \u{b7} homelab"), Some("log in with gh"));
+        let pr = read_prompt(
+            &p,
+            "GitHub",
+            Some("me@x.com"),
+            "password + 2FA code",
+            None,
+            Duration::from_secs(3600),
+            t,
+        );
+        assert_eq!(pr.title, "Share a password + 2FA code");
+        let rows: Vec<(&str, &str)> = pr
+            .rows
+            .iter()
+            .map(|r| (r.label.as_str(), r.value.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Agent", "pi \u{b7} homelab"),
+                ("Device", "nuc"),
+                ("Item", "GitHub"),
+                ("Username", "me@x.com"),
+                ("Releases", "password + 2FA code"),
+                ("Reason", "log in with gh"),
+            ]
+        );
+        assert_eq!(pr.touch_reason, "share GitHub with nuc");
+        assert_eq!(pr.timeout_secs, 60);
+        assert!(pr.note.is_some() && pr.input.is_none());
+        let p = pending(None, None);
+        let pr = read_prompt(&p, "x", Some(""), "password", None, Duration::ZERO, t);
+        assert_eq!(pr.rows[0].value, "not given");
+        assert_eq!(
+            pr.rows.last().map(|r| r.value.as_str()),
+            Some("no reason given")
+        );
+        assert!(pr.rows.iter().all(|r| r.label != "Username"));
+    }
+
+    #[test]
+    fn batch_prompt_rows() {
+        let t = Duration::from_secs(60);
+        let p = pending(Some("pi"), Some("ship"));
         let lines = [
             BatchLine {
                 name: "GitHub".into(),
@@ -2151,37 +2543,119 @@ mod tests {
                 fields: "password + 2FA code".into(),
             },
         ];
+        let pr = batch_prompt(&p, &lines, None, Duration::from_secs(3600), t);
+        assert_eq!(pr.title, "Share 2 logins");
+        let v = |l: &str| {
+            pr.rows
+                .iter()
+                .find(|r| r.label == l)
+                .map(|r| r.value.clone())
+        };
+        assert_eq!(v("Item 1").as_deref(), Some("GitHub (me) \u{b7} password"));
         assert_eq!(
-            batch_reason("w", &lines, None, Some("ship")),
-            format!(
-                "share 2 logins\n\nw\n{} (me) \u{b7} password\n{} \u{b7} password + 2FA code\nship",
-                bold("GitHub"),
-                bold("npm")
-            )
+            v("Item 2").as_deref(),
+            Some("npm \u{b7} password + 2FA code")
         );
-        assert!(batch_reason("w", &lines[..1], None, None).starts_with("share 1 login\n"));
-        let add = save_field_reason("w", "x", None, "K", &FieldChange::Add, None);
-        assert!(add.starts_with("save the field \u{201c}K\u{201d} the agent supplied\n\n"));
-        let replace = save_field_reason(
-            "w",
+        let one = batch_prompt(&p, &lines[..1], None, Duration::ZERO, t);
+        assert_eq!(one.title, "Share 1 login");
+    }
+
+    #[test]
+    fn write_prompts() {
+        let t = Duration::from_secs(60);
+        let p = pending(Some("pi"), Some("why"));
+        let c = create_prompt(&p, "Acme", Some("bot"), "6-word passphrase", t);
+        assert_eq!(c.title, "Create a login");
+        assert_eq!(labels(&c.choices), ["Create"]);
+        assert_eq!(c.default_choice, None);
+        assert!(
+            c.rows
+                .iter()
+                .any(|r| r.label == "Password" && r.value == "new 6-word passphrase")
+        );
+        let r = rotate_prompt(&p, "Acme", None, Some("st"), "6-word passphrase", t);
+        assert_eq!(r.title, "Replace a password");
+        assert!(
+            r.rows
+                .iter()
+                .any(|r| r.label == "New username" && r.value == "st")
+        );
+        let r = rotate_prompt(&p, "Acme", None, None, "6-word passphrase", t);
+        assert!(r.rows.iter().all(|r| r.label != "New username"));
+        assert_eq!(labels(&r.choices), ["Replace"]);
+        let s = save_prompt(&p, "Acme", None, t);
+        assert_eq!(s.title, "Save a password the agent supplied");
+        assert_eq!(labels(&s.choices), ["Save"]);
+        let a = totp_prompt(&p, "Acme", None, t);
+        assert_eq!(a.title, "Add 2FA and share a 2FA code");
+        assert_eq!(labels(&a.choices), ["Add 2FA"]);
+        let g = pairing_prompt("nuc", 75, t);
+        assert_eq!(g.title, "Pair a new device");
+        assert_eq!(
+            g.rows,
+            vec![
+                row("Device", "nuc"),
+                row("Pairing code", "issued 1 min ago")
+            ]
+        );
+        assert!(g.note.is_none());
+        assert_eq!(labels(&g.choices), ["Pair"]);
+    }
+
+    #[test]
+    fn field_prompts() {
+        let p = pending(Some("pi"), None);
+        let replace = FieldChange::Replace {
+            archived: "K (replaced 2026-11-17)".into(),
+        };
+        let title =
+            |c: &FieldChange, by| field_prompt(&p, "x", None, "K", c, by, ASK_TIMEOUT).title;
+        assert_eq!(
+            title(&FieldChange::Add, Source::Agent),
+            "Save the field \u{201c}K\u{201d} the agent supplied"
+        );
+        assert_eq!(
+            title(&replace, Source::Agent),
+            "Replace the field \u{201c}K\u{201d} with a value the agent supplied"
+        );
+        assert_eq!(
+            title(&FieldChange::Create, Source::Agent),
+            "Create a login holding the field \u{201c}K\u{201d} the agent supplied"
+        );
+        assert_eq!(
+            title(&FieldChange::Add, Source::Human),
+            "Enter a value for the field \u{201c}K\u{201d}"
+        );
+        assert_eq!(
+            title(&replace, Source::Human),
+            "Enter a new value for the field \u{201c}K\u{201d}"
+        );
+        assert_eq!(
+            title(&FieldChange::Create, Source::Human),
+            "Create a login holding the field \u{201c}K\u{201d}"
+        );
+        let h = field_prompt(&p, "x", None, "K", &replace, Source::Human, ASK_TIMEOUT);
+        assert!(h.rows.iter().any(|r| r.label == "Old value"));
+        assert!(h.input.is_some());
+        assert_eq!(h.timeout_secs, 180);
+        let a = field_prompt(
+            &p,
             "x",
             None,
-            "API Key",
-            &FieldChange::Replace {
-                archived: "API Key (replaced 2026-11-17)".into(),
-            },
-            None,
+            "K",
+            &FieldChange::Add,
+            Source::Agent,
+            ASK_TIMEOUT,
         );
-        assert!(replace.starts_with(
-            "replace the field \u{201c}API Key\u{201d} with a value the agent supplied, keeping the old one as \u{201c}API Key (replaced 2026-11-17)\u{201d}\n\n"
-        ));
-        let create = save_field_reason("w", "x", None, "K", &FieldChange::Create, None);
-        assert!(create.starts_with(
-            "create a login and save the field \u{201c}K\u{201d} the agent supplied\n\n"
-        ));
-        assert!(
-            credential_reason("w", "x", None, "field \u{201c}API Key\u{201d}", None, None)
-                .starts_with("share a field \u{201c}API Key\u{201d}\n\n")
+        assert!(a.rows.iter().all(|r| r.label != "Old value"));
+        assert!(a.input.is_none());
+    }
+
+    #[test]
+    fn clean_strips_invisible() {
+        assert_eq!(
+            clean("a\u{202e}b\u{200b}c\u{2066}d", 80).as_deref(),
+            Some("abcd")
         );
     }
 }

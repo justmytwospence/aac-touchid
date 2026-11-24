@@ -8,6 +8,8 @@ mod control;
 mod dialog;
 mod grants;
 mod intent;
+mod mask;
+mod panel;
 mod provision;
 mod refs;
 mod run;
@@ -46,6 +48,9 @@ enum Command {
         /// Seconds to wait for a Touch ID answer before denying.
         #[arg(long, default_value_t = 60)]
         approval_timeout: u64,
+        /// Seconds to wait for a locked or closed Mac before refusing a request.
+        #[arg(long, default_value_t = 50)]
+        wait_for_mac: u64,
         /// Longest `remember=` window an agent can ask for, in minutes (0 turns remembering off).
         #[arg(long, default_value_t = 60)]
         max_remember_minutes: u64,
@@ -56,6 +61,9 @@ enum Command {
         #[arg(long, value_name = "HOST")]
         pair_ssh: Vec<String>,
     },
+    /// Show one approval panel (used by serve).
+    #[command(hide = true)]
+    Prompt,
     /// Print a one-time pairing code (5 minutes) for a new device.
     Pair {
         /// Name to show in approval prompts, e.g. `nuc`.
@@ -90,6 +98,15 @@ enum Command {
         /// Seconds to wait for each answer (covers a master-password unlock).
         #[arg(long, default_value_t = 240)]
         timeout: u64,
+        /// Set a variable for the command; the value may hold bw:// references (repeatable; wins over --env-file).
+        #[arg(long = "env", value_name = "NAME=VALUE")]
+        env: Vec<String>,
+        /// Print the requests the command would make, as JSON, without asking.
+        #[arg(long)]
+        dry_run: bool,
+        /// Run the command directly, without masking secret values in its output.
+        #[arg(long)]
+        no_mask: bool,
         /// The command, after `--`.
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<String>,
@@ -105,9 +122,15 @@ fn main() -> ExitCode {
             reason,
             remember,
             timeout,
+            env,
+            dry_run,
+            no_mask,
             command,
         } => {
             return run::main(run::Args {
+                env_flags: env,
+                dry_run,
+                no_mask,
                 env_files: env_file,
                 agent,
                 reason,
@@ -116,6 +139,7 @@ fn main() -> ExitCode {
                 command,
             });
         }
+        Command::Prompt => return panel::child_main(),
         other => other,
     };
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -134,6 +158,7 @@ fn main() -> ExitCode {
                 proxy_url,
                 lock_after_hours,
                 approval_timeout,
+                wait_for_mac,
                 max_remember_minutes,
                 pair_local,
                 pair_ssh,
@@ -144,6 +169,7 @@ fn main() -> ExitCode {
                         proxy_url,
                         lock_after_hours,
                         approval_timeout,
+                        wait_for_mac,
                         max_remember_minutes,
                         pair_local,
                         pair_ssh,
@@ -166,6 +192,7 @@ fn main() -> ExitCode {
                     proxy_url,
                     lock_after: Duration::from_secs(lock_after_hours * 3600),
                     approval_timeout: Duration::from_secs(approval_timeout),
+                    wait_for_mac: Duration::from_secs(wait_for_mac),
                     max_remember: Duration::from_secs(max_remember_minutes * 60),
                     targets: pair_local
                         .iter()
@@ -186,7 +213,7 @@ fn main() -> ExitCode {
             Command::Lock => client(control::Request::Lock, false).await,
             Command::Revoke { name } => client(control::Request::Revoke { name }, false).await,
             Command::Forget => client(control::Request::Forget, false).await,
-            Command::Run { .. } => ExitCode::FAILURE,
+            Command::Run { .. } | Command::Prompt => ExitCode::FAILURE,
         }
     })
 }

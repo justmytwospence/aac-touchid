@@ -16,15 +16,26 @@ pub enum Outcome {
     Unavailable,
 }
 
-/// Ask for approval. macOS words the sheet `"<program>" is trying to <reason>.`
-/// and titles it with the program's file name, so the service runs from a
-/// binary named `Bitwarden` (see the README).
-pub async fn confirm(reason: String, timeout: Duration) -> Outcome {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(imp::confirm_blocking(&reason, timeout));
-    });
-    rx.await.unwrap_or(Outcome::Denied)
+/// Ask for approval with the system sheet. macOS words it `"<program>" is
+/// trying to <reason>.` and titles it with the program's file name, so the
+/// service runs from a binary named `Bitwarden` (see the README).
+pub fn confirm_blocking(reason: &str, timeout: Duration) -> Outcome {
+    imp::confirm_blocking(reason, timeout)
+}
+
+/// Whether a Touch ID (or Watch) approval could be shown right now.
+pub fn available() -> bool {
+    imp::availability().is_ok()
+}
+
+/// Like [`available`], with LocalAuthentication's reason when it is not.
+pub fn availability() -> Result<(), String> {
+    imp::availability()
+}
+
+/// Whether the login session's screen is locked (or there is no GUI session).
+pub fn screen_locked() -> bool {
+    imp::screen_locked()
 }
 
 #[cfg(target_os = "macos")]
@@ -34,9 +45,42 @@ mod imp {
     use std::time::Duration;
 
     use block2::RcBlock;
-    use objc2::runtime::Bool;
-    use objc2_foundation::{NSError, NSString};
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2_foundation::{NSDictionary, NSError, NSNumber, NSString};
     use objc2_local_authentication::{LAContext, LAPolicy};
+
+    pub fn availability() -> Result<(), String> {
+        // SAFETY: plain LocalAuthentication call on a context owned here.
+        unsafe {
+            LAContext::new()
+                .canEvaluatePolicy_error(
+                    LAPolicy::DeviceOwnerAuthenticationWithBiometricsOrCompanion,
+                )
+                .map_err(|e| format!("LAError {}: {}", e.code(), e.localizedDescription()))
+        }
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> *mut NSDictionary<NSString, AnyObject>;
+    }
+
+    pub fn screen_locked() -> bool {
+        // SAFETY: the function follows the Create rule: a null result or a
+        // +1 retained dictionary, which `Retained::from_raw` takes over.
+        unsafe {
+            let Some(dict) = Retained::from_raw(CGSessionCopyCurrentDictionary()) else {
+                return true;
+            };
+            let key = NSString::from_str("CGSSessionScreenIsLocked");
+            let Some(v) = dict.objectForKey(&key) else {
+                return false;
+            };
+            let n: Option<&NSNumber> = v.downcast_ref();
+            n.is_some_and(|n| n.boolValue())
+        }
+    }
 
     pub fn confirm_blocking(reason: &str, timeout: Duration) -> Outcome {
         let policy = LAPolicy::DeviceOwnerAuthenticationWithBiometricsOrCompanion;
@@ -85,5 +129,13 @@ mod imp {
 
     pub fn confirm_blocking(_reason: &str, _timeout: Duration) -> Outcome {
         Outcome::Unavailable
+    }
+
+    pub fn availability() -> Result<(), String> {
+        Err("not macOS".to_string())
+    }
+
+    pub fn screen_locked() -> bool {
+        false
     }
 }

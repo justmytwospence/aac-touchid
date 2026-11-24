@@ -19,6 +19,9 @@
 //! - `savefield:<item> name=<NAME> value64=<base64> [user=<u>] [url=<full url>]`
 //!   stores an API key the agent already has as a hidden custom field of an
 //!   item, or of a new login when there is no such item.
+//! - `ask:<item> name=<NAME> [user=<u>] [url=<full url>]` has the human type
+//!   an API key into a panel on the Mac; it is stored like `savefield:` and
+//!   never sent back to the agent.
 //! - `<item> remember=15m` is a read that also asks to release the same item
 //!   again for that long (1m-24h) without another sheet.
 //! - `<item> field=<NAME>` reads one custom field of an item (its value
@@ -66,6 +69,7 @@ pub enum Intent {
     Rotate(Rotate),
     Save(SaveLogin),
     SaveField(SaveField),
+    AskValue(AskValue),
     /// The device's own recent decisions, no sheet.
     Why,
 }
@@ -189,6 +193,17 @@ impl fmt::Debug for SaveField {
     }
 }
 
+/// An API key the human types on the Mac, to be stored as a hidden field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskValue {
+    pub item: String,
+    pub name: String,
+    /// For a new login only.
+    pub username: Option<String>,
+    /// For a new login only.
+    pub uri: Option<String>,
+}
+
 #[derive(PartialEq, Eq)]
 pub struct AddTotp {
     /// One word: a domain, an item name without spaces, or an item id.
@@ -247,7 +262,7 @@ impl fmt::Display for ParseError {
         f.write_str(match self {
             Self::MissingName => "new: needs a name",
             Self::BadName => "name must be 1-64 letters, digits, spaces or . - _ @ & + '",
-            Self::MissingItem => "totp:, rotate: and savefield: need an item",
+            Self::MissingItem => "totp:, rotate:, savefield: and ask: need an item",
             Self::BadItem => "item must be one word of at most 128 characters",
             Self::UnexpectedText => "unexpected text after the options",
             Self::UnknownOption => "unknown option",
@@ -271,7 +286,7 @@ impl fmt::Display for ParseError {
             Self::EmptyItem => "request names no item",
             Self::BadRemember => "remember must be 1m-24h, like 15m or 2h",
             Self::BadField => "field must be 1-64 letters, digits or _ . -",
-            Self::MissingFieldName => "savefield: needs name=",
+            Self::MissingFieldName => "savefield: and ask: need name=",
             Self::MissingValue => "savefield: needs value64=",
             Self::BadValue => {
                 "value64 must be base64 of 1-4096 bytes of text without control characters"
@@ -292,6 +307,8 @@ pub fn parse(what: &str) -> Result<Intent, ParseError> {
         parse_save(rest).map(Intent::Save)
     } else if let Some(rest) = strip_prefix_ci(s, "savefield:") {
         parse_savefield(rest).map(Intent::SaveField)
+    } else if let Some(rest) = strip_prefix_ci(s, "ask:") {
+        parse_ask_value(rest).map(Intent::AskValue)
     } else if let Some(rest) = strip_prefix_ci(s, "totp:") {
         parse_totp(rest).map(Intent::AddTotp)
     } else if let Some(rest) = strip_prefix_ci(s, "rotate:") {
@@ -718,6 +735,44 @@ fn parse_savefield(rest: &str) -> Result<SaveField, ParseError> {
     })
 }
 
+fn parse_ask_value(rest: &str) -> Result<AskValue, ParseError> {
+    let (words, options) = split_words(rest)?;
+    let item = match words.as_slice() {
+        [] => return Err(ParseError::MissingItem),
+        [item] => *item,
+        _ => return Err(ParseError::BadItem),
+    };
+    if item.len() > MAX_ITEM || item.chars().any(char::is_control) {
+        return Err(ParseError::BadItem);
+    }
+    let mut name = None;
+    let mut username = None;
+    let mut url = None;
+    for (key, v) in options {
+        let slot_taken = match key.to_ascii_lowercase().as_str() {
+            "name" => name.replace(parse_field(v)?).is_some(),
+            "user" => username.replace(parse_user(v)?).is_some(),
+            "url" => url.replace(parse_url(v)?).is_some(),
+            _ => return Err(ParseError::UnknownOption),
+        };
+        if slot_taken {
+            return Err(ParseError::DuplicateOption);
+        }
+    }
+    Ok(AskValue {
+        item: item.to_string(),
+        name: name.ok_or(ParseError::MissingFieldName)?,
+        username,
+        uri: url,
+    })
+}
+
+/// Whether text can be stored as a custom field value: 1-4096 bytes, no
+/// control characters.
+pub fn valid_field_value(text: &str) -> bool {
+    !text.is_empty() && text.len() <= MAX_FIELD_VALUE && !text.chars().any(char::is_control)
+}
+
 fn parse_value64(value: &str) -> Result<Zeroizing<String>, ParseError> {
     if value.len() > MAX_FIELD_B64 {
         return Err(ParseError::BadValue);
@@ -726,7 +781,7 @@ fn parse_value64(value: &str) -> Result<Zeroizing<String>, ParseError> {
     let text = String::from_utf8(bytes.to_vec())
         .map(Zeroizing::new)
         .map_err(|_| ParseError::BadValue)?;
-    if text.is_empty() || text.len() > MAX_FIELD_VALUE || text.chars().any(char::is_control) {
+    if !valid_field_value(&text) {
         return Err(ParseError::BadValue);
     }
     Ok(text)
@@ -1604,5 +1659,41 @@ mod tests {
             Err(ParseError::DuplicateOption)
         );
         assert_eq!(parse("batch:a=b"), Err(ParseError::BadItem));
+    }
+
+    #[test]
+    fn ask_values() {
+        let ok = |s: &str| match parse(s) {
+            Ok(Intent::AskValue(a)) => a,
+            other => panic!("{s}: {other:?}"),
+        };
+        let a = ok("ask:openai.com name=API_KEY");
+        assert_eq!(
+            (a.item.as_str(), a.name.as_str()),
+            ("openai.com", "API_KEY")
+        );
+        assert_eq!((a.username, a.uri), (None, None));
+        let a = ok("ask:x name=K user=a url=https://x.io");
+        assert_eq!(a.username.as_deref(), Some("a"));
+        assert_eq!(a.uri.as_deref(), Some("https://x.io"));
+        assert_eq!(parse("ask:"), Err(ParseError::MissingItem));
+        assert_eq!(parse("ask:a b name=K"), Err(ParseError::BadItem));
+        assert_eq!(parse("ask:x"), Err(ParseError::MissingFieldName));
+        assert_eq!(
+            parse("ask:x name=K value64=YQ"),
+            Err(ParseError::UnknownOption)
+        );
+        assert_eq!(
+            parse("ask:x name=K name=L"),
+            Err(ParseError::DuplicateOption)
+        );
+    }
+
+    #[test]
+    fn field_values() {
+        assert!(!valid_field_value(""));
+        assert!(valid_field_value(&"a".repeat(4096)));
+        assert!(!valid_field_value(&"a".repeat(4097)));
+        assert!(!valid_field_value("a\nb"));
     }
 }
